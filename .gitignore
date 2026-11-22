@@ -1,0 +1,39 @@
+# Claves privadas y propiedades de firma (NUNCA subir a Git)
+*.jks
+*.keystore
+*.cer
+*.crt
+*.pfx
+*.p12
+*.pem
+*.key
+keystore.properties
+android/keystore.properties
+secrets.*
+credentials.*
+.env
+.env.*
+
+# Compilaciones y entregables generados
+build/
+dist/
+android/.gradle/
+android/.kotlin/
+android/app/build/
+android/local.properties
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+*.tmp
+*.bak
+
+# Archivos de IDE / usuario / metadatos locales
+.vs/
+.idea/
+*.user
+*.suo
+.obsidian_vault
+.project-memory/

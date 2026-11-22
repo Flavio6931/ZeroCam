@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ZeroCam Tokens (Figma) -->
+    <color name="bg_canvas">#0F1117</color>
+    <color name="bg_surface">#171A21</color>
+    <color name="bg_card">#1F242E</color>
+    <color name="bg_input">#262C38</color>
+    <color name="bg_oled">#000000</color>
+    <color name="bg_preview">#0D121C</color>
+
+    <color name="border_subtle">#2E3545</color>
+    <color name="border_accent">#2D7DFF</color>
+
+    <color name="text_primary">#F1F3F7</color>
+    <color name="text_secondary">#9AA4B2</color>
+    <color name="text_muted">#6B7485</color>
+
+    <color name="accent_primary">#2D7DFF</color>
+    <color name="status_success">#22C55E</color>
+    <color name="status_warning">#F59E0B</color>
+    <color name="status_danger">#EF4444</color>
+</resources>
