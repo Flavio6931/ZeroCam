@@ -223,14 +223,20 @@ void RunDShowSelfTests(
 
                 Microsoft::WRL::ComPtr<MockDShowSinkPin> sinkYuy2;
                 sinkYuy2.Attach(new MockDShowSinkPin(MEDIASUBTYPE_YUY2, 1280, 720));
-                if (SUCCEEDED(outPin->Connect(sinkYuy2.Get(), yuy2Mt)) && SUCCEEDED(dsFilter->Run(0))) {
-                    for (int w = 0; w < 40 && sinkYuy2->Frames() < 2u; ++w) {
-                        Sleep(25);
+                if (SUCCEEDED(outPin->Connect(sinkYuy2.Get(), yuy2Mt)) && SUCCEEDED(dsFilter->Pause())) {
+                    FILTER_STATE pauseSt = State_Stopped;
+                    const HRESULT hrPauseState = dsFilter->GetState(0, &pauseSt);
+                    const bool pauseCantCueOk = (hrPauseState == VFW_S_CANT_CUE && pauseSt == State_Paused);
+                    if (SUCCEEDED(dsFilter->Run(0))) {
+                        for (int w = 0; w < 40 && sinkYuy2->Frames() < 2u; ++w) {
+                            Sleep(25);
+                        }
+                        outYuy2Ok = (pauseCantCueOk &&
+                                     sinkYuy2->Frames() >= 2u &&
+                                     sinkYuy2->LastLen() == 1280L * 720L * 2L &&
+                                     sinkYuy2->LastY() >= 175 && sinkYuy2->LastY() <= 185 &&
+                                     sinkYuy2->LastU() == 128);
                     }
-                    outYuy2Ok = (sinkYuy2->Frames() >= 2u &&
-                                 sinkYuy2->LastLen() == 1280L * 720L * 2L &&
-                                 sinkYuy2->LastY() >= 175 && sinkYuy2->LastY() <= 185 &&
-                                 sinkYuy2->LastU() == 128);
                     dsFilter->Stop();
                     outPin->Disconnect();
                     sinkYuy2->Disconnect();

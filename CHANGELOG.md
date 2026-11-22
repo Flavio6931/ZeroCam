@@ -2,6 +2,13 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.1] - 2026-11-21
+### Corregido y Endurecido
+- **Detección garantizada en Discord (Windows 11 + Windows 10):**
+  - `VirtualCameraHost`: ahora registra el filtro DirectShow (`ZeroCamDShow64.dll` 64-bit + `ZeroCamDShow32.dll` 32-bit) tanto en Windows 10 como en Windows 11, dado que el módulo de video de Discord (`discord_voice.node`) enumera únicamente DirectShow (`CLSID_VideoInputDeviceCategory` / `devenum.dll`) en ambas versiones de Windows, manteniendo en paralelo Media Foundation (`ZeroCamSource.dll`) para Cámara de Windows y apps UWP.
+  - Eliminación automática de cámaras MF duplicadas en Windows 11 corrigiendo `IsSystemMfCameraPresent()` por prefijo (`"ZeroCam Virtual Camera"`) y limpiando variantes anteriores en registro/desregistro.
+- **Hardening DirectShow (`ZeroCamDShowFilter`):** negociación exacta de `cbBuffer` en `Connect()` con limpieza de `pReceivePin->Disconnect()` ante fallos, `VFW_S_CANT_CUE` en `GetState(State_Paused)` y timestamps monotónicos basados en `QueryPerformanceCounter`.
+
 ## [1.3.0] - 2026-11-21
 ### Añadido y Mejorado
 - **Compatibilidad universal Windows 10 + Windows 11 y detección fiable en Discord:**

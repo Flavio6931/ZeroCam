@@ -395,6 +395,35 @@ HRESULT CreateMfCamWithCategories(
     return hr;
 }
 
+void RemoveAllSystemMfCameras(const MfVirtualCamApi& api) {
+    if (!api.create) return;
+    const GUID cats[2] = { kKsCategoryVideoCamera, kKsCategoryCapture };
+    const struct {
+        const GUID* ptr;
+        ULONG count;
+    } variants[] = {
+        { cats, 2 },
+        { cats, 1 },
+        { nullptr, 0 }
+    };
+    for (const auto& v : variants) {
+        Microsoft::WRL::ComPtr<IMFVirtualCamera> cam;
+        if (SUCCEEDED(api.create(
+                MFVirtualCameraType_SoftwareCameraSource,
+                MFVirtualCameraLifetime_System,
+                MFVirtualCameraAccess_AllUsers,
+                kZeroCamFriendlyName,
+                kZeroCamClsidString,
+                v.ptr,
+                v.count,
+                &cam)) && cam) {
+            cam->Stop();
+            cam->Remove();
+            cam->Shutdown();
+        }
+    }
+}
+
 void UnregisterDShowBestEffort() {
     std::wstring dll64;
     if (QueryClsidInprocPath(kZeroCamDShowClsidString, 0, dll64) && IsExistingRegularFile(dll64)) {
@@ -473,12 +502,14 @@ bool VirtualCameraHost::IsSystemMfCameraPresent() {
     }
 
     bool found = false;
+    const size_t prefixLen = wcslen(kZeroCamFriendlyName);
     for (UINT32 i = 0; i < count; ++i) {
         if (devices[i]) {
             wchar_t nameBuf[256]{};
             UINT32 len = 0;
             if (!found && SUCCEEDED(devices[i]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, nameBuf, 256, &len))) {
-                if (_wcsicmp(nameBuf, kZeroCamFriendlyName) == 0) {
+                // Windows 11 anexa " (Windows Virtual Camera)" al nombre visible del dispositivo MF.
+                if (_wcsnicmp(nameBuf, kZeroCamFriendlyName, prefixLen) == 0) {
                     found = true;
                 }
             }
@@ -495,6 +526,10 @@ bool VirtualCameraHost::IsComRegistered(std::wstring* outDllPath) {
         if (!QueryClsidInprocPath(kZeroCamClsidString, 0, path)) {
             return false;
         }
+        // En Windows 11 Discord requiere DirectShow ademas de Media Foundation.
+        if (!IsDShowRegistered()) {
+            return false;
+        }
         if (outDllPath) *outDllPath = path;
         return true;
     }
@@ -506,9 +541,9 @@ bool VirtualCameraHost::IsInstalledDllUpToDate() {
     if (localDir.empty()) return true;
 
     if (IsMfVirtualCameraSupported()) {
-        std::wstring installedPath;
-        if (!IsComRegistered(&installedPath)) return false;
-        return AreFilesIdentical(localDir + L"ZeroCamSource.dll", installedPath);
+        std::wstring installedMf;
+        if (!QueryClsidInprocPath(kZeroCamClsidString, 0, installedMf)) return false;
+        if (!AreFilesIdentical(localDir + L"ZeroCamSource.dll", installedMf)) return false;
     }
 
     std::wstring installed64;
@@ -547,14 +582,11 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
     const std::wstring localDs64 = localDir + L"ZeroCamDShow64.dll";
     const std::wstring localDs32 = localDir + L"ZeroCamDShow32.dll";
 
-    if (useMfWin11) {
-        if (!IsExistingRegularFile(localMfDll)) {
-            return fail(L"No se encontró ZeroCamSource.dll junto a ZeroCam.exe.");
-        }
-    } else {
-        if (!IsExistingRegularFile(localDs64)) {
-            return fail(L"No se encontró ZeroCamDShow64.dll junto a ZeroCam.exe para Windows 10.");
-        }
+    if (!IsExistingRegularFile(localDs64)) {
+        return fail(L"No se encontró ZeroCamDShow64.dll junto a ZeroCam.exe.");
+    }
+    if (useMfWin11 && !IsExistingRegularFile(localMfDll)) {
+        return fail(L"No se encontró ZeroCamSource.dll junto a ZeroCam.exe.");
     }
 
     // Detiene FrameServer temporalmente si está activo en Win11 para reemplazar DLLs sin bloqueo.
@@ -636,13 +668,6 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
             return fail(L"No se pudo copiar o proteger ZeroCamSource.dll en ProgramData.");
         }
 
-        // Evita cámaras duplicadas en Windows 11 limpiando restos previos de DirectShow si existieran.
-        UnregisterDShowBestEffort();
-        if (!IsPathReparsePoint(dirPath)) {
-            DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll");
-            DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll");
-        }
-
         const HRESULT regHr = CallDllRegEntry(installedMf, "DllRegisterServer");
         if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
         if (svc) CloseServiceHandle(svc);
@@ -651,22 +676,17 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
         if (FAILED(regHr)) {
             return fail(L"DllRegisterServer falló (HRESULT " + FormatHrHex(regHr) + L").");
         }
-        if (!IsComRegistered() || !IsInstalledDllUpToDate()) {
-            return fail(L"El registro COM no pudo verificarse en HKLM.");
+        std::wstring mfPath;
+        if (!QueryClsidInprocPath(kZeroCamClsidString, 0, mfPath)) {
+            return fail(L"El registro COM de ZeroCamSource no pudo verificarse en HKLM.");
         }
 
-        // Registra cámara persistente de sistema (AllUsers) para que Discord la detecte sin conflictos UAC.
+        // Limpia variantes duplicadas y registra una única cámara persistente AllUsers en Win11.
         ScopedCoInit co;
         const MfVirtualCamApi& api = GetMfVirtualCamApi();
         if (api.create && (SUCCEEDED(co.hr) || co.hr == RPC_E_CHANGED_MODE)) {
-            Microsoft::WRL::ComPtr<IMFVirtualCamera> oldCam;
-            if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &oldCam)) && oldCam) {
-                oldCam->Stop();
-                oldCam->Remove();
-                oldCam->Shutdown();
-                oldCam.Reset();
-                Sleep(100);
-            }
+            RemoveAllSystemMfCameras(api);
+            Sleep(100);
             Microsoft::WRL::ComPtr<IMFVirtualCamera> sysCam;
             if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &sysCam)) && sysCam) {
                 (void)sysCam->Start(nullptr);
@@ -676,26 +696,27 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
     } else {
         if (svc) CloseServiceHandle(svc);
         if (scm) CloseServiceHandle(scm);
+    }
 
-        const std::wstring installed64 = dirPath + L"\\ZeroCamDShow64.dll";
-        if (!CopyAndHardenDll(localDs64, installed64)) {
-            return fail(L"No se pudo copiar o proteger ZeroCamDShow64.dll en ProgramData.");
-        }
-        const HRESULT hr64 = CallDllRegEntry(installed64, "DllRegisterServer");
-        if (FAILED(hr64)) {
-            return fail(L"DllRegisterServer DirectShow 64-bit falló (HRESULT " + FormatHrHex(hr64) + L").");
-        }
+    // Registra filtro DirectShow 64-bit y 32-bit tanto en Windows 10 como en Windows 11 (Discord/OBS/Zoom).
+    const std::wstring installed64 = dirPath + L"\\ZeroCamDShow64.dll";
+    if (!CopyAndHardenDll(localDs64, installed64)) {
+        return fail(L"No se pudo copiar o proteger ZeroCamDShow64.dll en ProgramData.");
+    }
+    const HRESULT hr64 = CallDllRegEntry(installed64, "DllRegisterServer");
+    if (FAILED(hr64)) {
+        return fail(L"DllRegisterServer DirectShow 64-bit falló (HRESULT " + FormatHrHex(hr64) + L").");
+    }
 
-        if (IsExistingRegularFile(localDs32)) {
-            const std::wstring installed32 = dirPath + L"\\ZeroCamDShow32.dll";
-            if (!CopyAndHardenDll(localDs32, installed32) || !RunWow64Regsvr32(installed32, false)) {
-                return fail(L"No se pudo registrar ZeroCamDShow32.dll (compatibilidad apps 32-bit).");
-            }
+    if (IsExistingRegularFile(localDs32)) {
+        const std::wstring installed32 = dirPath + L"\\ZeroCamDShow32.dll";
+        if (!CopyAndHardenDll(localDs32, installed32) || !RunWow64Regsvr32(installed32, false)) {
+            return fail(L"No se pudo registrar ZeroCamDShow32.dll (compatibilidad apps 32-bit).");
         }
+    }
 
-        if (!IsDShowRegistered() || !IsInstalledDllUpToDate()) {
-            return fail(L"No se pudo verificar el registro DirectShow en HKLM.");
-        }
+    if (!IsComRegistered() || !IsDShowRegistered() || !IsInstalledDllUpToDate()) {
+        return fail(L"No se pudo verificar el registro COM/DirectShow en HKLM.");
     }
 
     UpsertFirewallRule(
@@ -724,12 +745,7 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
         ScopedCoInit co;
         const MfVirtualCamApi& api = GetMfVirtualCamApi();
         if (api.create && (SUCCEEDED(co.hr) || co.hr == RPC_E_CHANGED_MODE)) {
-            Microsoft::WRL::ComPtr<IMFVirtualCamera> sysCam;
-            if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &sysCam)) && sysCam) {
-                sysCam->Stop();
-                sysCam->Remove();
-                sysCam->Shutdown();
-            }
+            RemoveAllSystemMfCameras(api);
         }
     }
 
@@ -799,6 +815,7 @@ bool VirtualCameraHost::Start(std::wstring& outError) {
     if (IsMfVirtualCameraSupported()) {
         if (IsSystemMfCameraPresent()) {
             systemCameraActive_ = true;
+            dshowActive_ = IsDShowRegistered();
             outError.clear();
             return true;
         }
@@ -828,6 +845,7 @@ bool VirtualCameraHost::Start(std::wstring& outError) {
             return false;
         }
 
+        dshowActive_ = IsDShowRegistered();
         outError.clear();
         return true;
     }

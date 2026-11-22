@@ -587,12 +587,14 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
         bool yuy2 = false;
         REFERENCE_TIME avg = 333333;
         if (!ExtractFormatParams(cand, w, h, yuy2, avg)) {
+            pReceivePin->Disconnect();
             continue;
         }
 
         Microsoft::WRL::ComPtr<IMemAllocator> alloc;
         if (FAILED(memIn->GetAllocator(&alloc)) || !alloc) {
             if (FAILED(CoCreateInstance(CLSID_MemoryAllocator, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&alloc)))) {
+                pReceivePin->Disconnect();
                 continue;
             }
         }
@@ -603,7 +605,7 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
         const long bufSize = static_cast<long>(std::max<size_t>(cand->lSampleSize, minFrameBytes));
         ALLOCATOR_PROPERTIES req{};
         req.cBuffers = 3;
-        req.cbBuffer = std::max<long>(bufSize, 1280L * 720L * 2L);
+        req.cbBuffer = bufSize;
         req.cbAlign = 16;
         req.cbPrefix = 0;
 
@@ -614,13 +616,16 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
             hrProps = alloc->SetProperties(&req, &actual);
         }
         if (FAILED(hrProps) || actual.cbBuffer < bufSize) {
+            pReceivePin->Disconnect();
             continue;
         }
         if (FAILED(memIn->NotifyAllocator(alloc.Get(), FALSE))) {
+            pReceivePin->Disconnect();
             continue;
         }
 
         if (FAILED(CopyMediaTypeFields(connectedMt_, *cand))) {
+            pReceivePin->Disconnect();
             clearCandidates();
             return E_OUTOFMEMORY;
         }
@@ -900,7 +905,10 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
     std::vector<uint32_t> xMapYuy2;
     uint64_t lastSeq = 0;
     ULONGLONG lastDeliverMs = 0;
-    REFERENCE_TIME streamCursor = 0;
+    LARGE_INTEGER qpcFreq{}, qpcStart{};
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcStart);
+    REFERENCE_TIME lastRtStart = -1;
     bool firstSample = true;
 
     while (!stopRequested_.load(std::memory_order_acquire)) {
@@ -1000,9 +1008,24 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
             sample->SetActualDataLength(static_cast<long>(minNeeded));
         }
 
-        REFERENCE_TIME rtStart = streamCursor;
+        REFERENCE_TIME rtStart = 0;
+        if (!firstSample) {
+            REFERENCE_TIME qpcTicks = (lastRtStart >= 0) ? (lastRtStart + activeDur) : activeDur;
+            if (qpcFreq.QuadPart > 0) {
+                LARGE_INTEGER qpcNow{};
+                QueryPerformanceCounter(&qpcNow);
+                const int64_t delta = qpcNow.QuadPart - qpcStart.QuadPart;
+                if (delta > 0) {
+                    const int64_t secs = delta / qpcFreq.QuadPart;
+                    const int64_t rem = delta % qpcFreq.QuadPart;
+                    qpcTicks = static_cast<REFERENCE_TIME>(
+                        secs * 10000000LL + (rem * 10000000LL) / qpcFreq.QuadPart);
+                }
+            }
+            rtStart = (lastRtStart >= 0 && qpcTicks <= lastRtStart) ? (lastRtStart + 10000LL) : qpcTicks;
+        }
         REFERENCE_TIME rtStop = rtStart + activeDur;
-        streamCursor = rtStop;
+        lastRtStart = rtStart;
 
         sample->SetTime(&rtStart, &rtStop);
         sample->SetSyncPoint(TRUE);
@@ -1119,8 +1142,9 @@ IFACEMETHODIMP ZeroCamDShowFilter::Run(REFERENCE_TIME) {
 
 IFACEMETHODIMP ZeroCamDShowFilter::GetState(DWORD, FILTER_STATE* State) {
     if (!State) return E_POINTER;
-    *State = state_.load(std::memory_order_acquire);
-    return S_OK;
+    const FILTER_STATE s = state_.load(std::memory_order_acquire);
+    *State = s;
+    return (s == State_Paused) ? VFW_S_CANT_CUE : S_OK;
 }
 
 IFACEMETHODIMP ZeroCamDShowFilter::SetSyncSource(IReferenceClock* pClock) {
