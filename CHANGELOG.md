@@ -2,6 +2,12 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.2] - 2026-11-21
+### Mejorado
+- **Calidad visual nítida en Discord (`I420` nativo + supersampling bilineal sin GPU extra):**
+  - `ZeroCamDShow64/32.dll` (`ZeroCamDShowFilter` + `DllMain`): expone **`I420` (`kMediaSubtypeI420`)** como formato nativo prioritario para WebRTC/Discord además de `NV12` y `YUY2`, evitando doble conversión de espacio de color.
+  - Sustituido el muestreo *nearest-neighbor* por **filtro bilineal entero rápido** alineado al centro (luma y croma sin saltos de bloque en `I420`, `NV12` y `YUY2`) con caché de tablas y recorte centrado por relación de aspecto (evita estiramiento en `4:3`) en `ZeroCamDShow64/32.dll` y el fallback CPU de `ZeroCamSource.dll`.
+
 ## [1.3.1] - 2026-11-21
 ### Corregido y Endurecido
 - **Detección garantizada en Discord (Windows 11 + Windows 10):**

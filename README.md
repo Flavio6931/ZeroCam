@@ -1,4 +1,4 @@
-# ZeroCam `v1.3.1`
+# ZeroCam `v1.3.2`
 
 Cámara virtual de ultra baja latencia y código limpio para **Windows 10 / Windows 11 x64** y **Android 8.0+**, con pipeline de video H.264 acelerado por hardware **Zero-Copy** de extremo a extremo y transporte autenticado/cifrado **`ZeroCam Wire v2`**.
 
@@ -22,7 +22,7 @@ flowchart LR
 
     subgraph VCam["Windows FrameServer / DirectShow"]
         IPC -->|OpenSharedResource Zero-Copy Win11| DLL["ZeroCamSource.dll\n(IMFDXGIBuffer)"]
-        IPC -->|CPU NV12 / YUY2 Win10 y Win11 Discord/OBS/Zoom| DS["ZeroCamDShow64/32.dll\n(DirectShow Filter)"]
+        IPC -->|I420 / NV12 / YUY2 Bilineal Win10 y Win11 Discord/OBS/Zoom| DS["ZeroCamDShow64/32.dll\n(DirectShow Filter)"]
         DLL --> APPS["OBS / Zoom / Discord / Meet / Cámara Windows"]
         DS --> APPS
     end
@@ -113,7 +113,7 @@ gradle testDebugUnitTest assembleRelease --no-daemon
 
 ### 3. Empaquetado completo (Windows + Android + Instalador)
 ```powershell
-.\scripts\package_release.ps1 -Version "1.3.1"
+.\scripts\package_release.ps1 -Version "1.3.2"
 ```
 Genera los artefactos finales dentro de `dist/` (excluidos del control de versiones).
 

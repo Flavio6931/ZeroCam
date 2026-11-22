@@ -61,36 +61,76 @@ private:
             return;
         }
 
-        std::vector<uint32_t> xMapY(dstW);
-        for (uint32_t x = 0; x < dstW; ++x) {
-            xMapY[x] = std::min(srcW - 1u, static_cast<uint32_t>((static_cast<uint64_t>(x) * srcW) / dstW));
+        struct BilinearTap { uint32_t i0, i1; uint16_t w1, w0; };
+        auto buildLut = [](uint32_t cropOffset, uint32_t cropLen, uint32_t dstLen, uint32_t stride, std::vector<BilinearTap>& lut) {
+            lut.resize(dstLen);
+            if (cropLen <= 1u) {
+                const uint32_t idx = cropOffset * stride;
+                for (uint32_t d = 0; d < dstLen; ++d) lut[d] = { idx, idx, 0u, 256u };
+                return;
+            }
+            const int64_t maxFp = static_cast<int64_t>(cropLen - 1u) << 8;
+            const uint32_t maxSample = cropOffset + cropLen - 1u;
+            for (uint32_t d = 0; d < dstLen; ++d) {
+                const int64_t fp = std::clamp<int64_t>(
+                    ((2LL * static_cast<int64_t>(d) + 1LL) * static_cast<int64_t>(cropLen) * 128LL) /
+                        static_cast<int64_t>(dstLen) - 128LL,
+                    0LL, maxFp);
+                const uint32_t base = cropOffset + static_cast<uint32_t>(fp >> 8);
+                const uint32_t next = std::min(maxSample, base + 1u);
+                const uint16_t w1 = static_cast<uint16_t>(fp & 0xFFLL);
+                lut[d] = { base * stride, next * stride, w1, static_cast<uint16_t>(256u - w1) };
+            }
+        };
+
+        uint32_t cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+        const uint64_t lhs = static_cast<uint64_t>(srcW) * dstH;
+        const uint64_t rhs = static_cast<uint64_t>(dstW) * srcH;
+        if (lhs > rhs) {
+            uint32_t cw = static_cast<uint32_t>((rhs + dstH / 2u) / dstH) & ~1u;
+            cropW = std::clamp(cw, 2u, srcW & ~1u);
+            cropX = ((srcW - cropW) / 2u) & ~1u;
+        } else if (rhs > lhs) {
+            uint32_t ch = static_cast<uint32_t>((lhs + dstW / 2u) / dstW) & ~1u;
+            cropH = std::clamp(ch, 2u, srcH & ~1u);
+            cropY = ((srcH - cropH) / 2u) & ~1u;
         }
+
+        std::vector<BilinearTap> xLutY, yLutY, xLutUv, yLutUv;
+        buildLut(cropX, cropW, dstW, 1u, xLutY);
+        buildLut(cropY, cropH, dstH, 1u, yLutY);
+        buildLut(cropX / 2u, cropW / 2u, dstW / 2u, 2u, xLutUv);
+        buildLut(cropY / 2u, cropH / 2u, dstH / 2u, 1u, yLutUv);
+
         for (uint32_t y = 0; y < dstH; ++y) {
-            const uint32_t sy = std::min(srcH - 1u, static_cast<uint32_t>((static_cast<uint64_t>(y) * srcH) / dstH));
-            const uint8_t* sRow = src + static_cast<size_t>(sy) * srcStride;
+            const BilinearTap& yt = yLutY[y];
+            const uint8_t* s0 = src + static_cast<size_t>(yt.i0) * srcStride;
+            const uint8_t* s1 = src + static_cast<size_t>(yt.i1) * srcStride;
             uint8_t* dRow = dst + static_cast<size_t>(y) * dstStride;
             for (uint32_t x = 0; x < dstW; ++x) {
-                dRow[x] = sRow[xMapY[x]];
+                const BilinearTap& xt = xLutY[x];
+                const uint32_t top = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+                const uint32_t bot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+                dRow[x] = static_cast<uint8_t>((top * yt.w0 + bot * yt.w1 + 32768u) >> 16);
             }
         }
 
-        const uint32_t srcPairsW = std::max(1u, srcW / 2u);
-        const uint32_t srcPairsH = std::max(1u, srcH / 2u);
         const uint32_t dstPairsW = dstW / 2u;
         const uint32_t dstPairsH = dstH / 2u;
-        std::vector<uint32_t> xMapUv(dstPairsW);
-        for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-            xMapUv[cx] = std::min(srcPairsW - 1u, static_cast<uint32_t>((static_cast<uint64_t>(cx) * srcPairsW) / std::max(1u, dstPairsW))) * 2u;
-        }
         for (uint32_t cy = 0; cy < dstPairsH; ++cy) {
-            const uint32_t sy = std::min(srcPairsH - 1u, static_cast<uint32_t>((static_cast<uint64_t>(cy) * srcPairsH) / std::max(1u, dstPairsH)));
-            const uint8_t* sRow = srcUv + static_cast<size_t>(sy) * srcStride;
+            const BilinearTap& yt = yLutUv[cy];
+            const uint8_t* s0 = srcUv + static_cast<size_t>(yt.i0) * srcStride;
+            const uint8_t* s1 = srcUv + static_cast<size_t>(yt.i1) * srcStride;
             uint8_t* dRow = dstUv + static_cast<size_t>(cy) * dstStride;
             for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-                const size_t sx = xMapUv[cx];
+                const BilinearTap& xt = xLutUv[cx];
                 const size_t dx = static_cast<size_t>(cx) * 2u;
-                dRow[dx] = sRow[sx];
-                dRow[dx + 1u] = sRow[sx + 1u];
+                const uint32_t uTop = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+                const uint32_t uBot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+                const uint32_t vTop = static_cast<uint32_t>(s0[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1 + 1u]) * xt.w1;
+                const uint32_t vBot = static_cast<uint32_t>(s1[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1 + 1u]) * xt.w1;
+                dRow[dx] = static_cast<uint8_t>((uTop * yt.w0 + uBot * yt.w1 + 32768u) >> 16);
+                dRow[dx + 1u] = static_cast<uint8_t>((vTop * yt.w0 + vBot * yt.w1 + 32768u) >> 16);
             }
         }
     }

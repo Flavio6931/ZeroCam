@@ -137,14 +137,15 @@ STDAPI DllRegisterServer() {
 
     (void)mapper->UnregisterFilter(&CLSID_VideoInputDeviceCategory, kZeroCamFriendlyName, CLSID_ZeroCamDShow);
 
-    const REGPINTYPES pinTypes[2] = {
+    const REGPINTYPES pinTypes[3] = {
+        { &MEDIATYPE_Video, &kMediaSubtypeI420 },
         { &MEDIATYPE_Video, &MEDIASUBTYPE_NV12 },
         { &MEDIATYPE_Video, &MEDIASUBTYPE_YUY2 }
     };
     REGFILTERPINS2 pinInfo{};
     pinInfo.dwFlags = REG_PINFLAG_B_OUTPUT;
     pinInfo.cInstances = 1;
-    pinInfo.nMediaTypes = 2;
+    pinInfo.nMediaTypes = 3;
     pinInfo.lpMediaType = pinTypes;
     pinInfo.nMediums = 0;
     pinInfo.lpMedium = nullptr;

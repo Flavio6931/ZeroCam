@@ -20,7 +20,13 @@ namespace zerocam {
 
 class ZeroCamDShowFilter;
 
-/// Pin de salida DirectShow compatible con Discord, OBS y Zoom (NV12 y YUY2 sin BaseClasses).
+enum class DShowPixelFmt : uint8_t {
+    I420 = 0,
+    NV12 = 1,
+    YUY2 = 2
+};
+
+/// Pin de salida DirectShow compatible con Discord, OBS y Zoom (I420, NV12 y YUY2 sin BaseClasses).
 class ZeroCamDShowPin final
     : public IPin
     , public IAMStreamConfig
@@ -78,10 +84,10 @@ private:
         const AM_MEDIA_TYPE* pmt,
         UINT32& outW,
         UINT32& outH,
-        bool& outYuy2,
+        DShowPixelFmt& outFmt,
         REFERENCE_TIME& outAvgTimePerFrame) noexcept;
 
-    void PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REFERENCE_TIME frameDurHns);
+    void PushThreadMain(UINT32 dstW, UINT32 dstH, DShowPixelFmt dstFmt, REFERENCE_TIME frameDurHns);
 
     ZeroCamDShowFilter* filter_ = nullptr;
     std::mutex lock_;
@@ -97,7 +103,7 @@ private:
 
     UINT32 fmtWidth_ = 1280;
     UINT32 fmtHeight_ = 720;
-    bool fmtIsYuy2_ = false;
+    DShowPixelFmt fmtPixel_ = DShowPixelFmt::I420;
     REFERENCE_TIME fmtAvgTime_ = 333333; // 30 fps en unidades de 100 ns
 
     std::atomic<bool> stopRequested_{ false };

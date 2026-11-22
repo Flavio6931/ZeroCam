@@ -20,20 +20,25 @@ struct DShowModeDesc {
     UINT32 w;
     UINT32 h;
     UINT32 fps;
-    bool yuy2;
+    DShowPixelFmt fmt;
 };
 
 constexpr DShowModeDesc kDShowModes[] = {
-    { 1280, 720,  30, false },
-    { 1280, 720,  30, true  },
-    { 1920, 1080, 30, false },
-    { 1920, 1080, 30, true  },
-    { 1280, 720,  60, false },
-    { 1280, 720,  60, true  },
-    { 1920, 1080, 60, false },
-    { 1920, 1080, 60, true  },
-    { 640,  480,  30, false },
-    { 640,  480,  30, true  }
+    { 1280, 720,  30, DShowPixelFmt::I420 },
+    { 1280, 720,  30, DShowPixelFmt::NV12 },
+    { 1280, 720,  30, DShowPixelFmt::YUY2 },
+    { 1920, 1080, 30, DShowPixelFmt::I420 },
+    { 1920, 1080, 30, DShowPixelFmt::NV12 },
+    { 1920, 1080, 30, DShowPixelFmt::YUY2 },
+    { 1280, 720,  60, DShowPixelFmt::I420 },
+    { 1280, 720,  60, DShowPixelFmt::NV12 },
+    { 1280, 720,  60, DShowPixelFmt::YUY2 },
+    { 1920, 1080, 60, DShowPixelFmt::I420 },
+    { 1920, 1080, 60, DShowPixelFmt::NV12 },
+    { 1920, 1080, 60, DShowPixelFmt::YUY2 },
+    { 640,  480,  30, DShowPixelFmt::I420 },
+    { 640,  480,  30, DShowPixelFmt::NV12 },
+    { 640,  480,  30, DShowPixelFmt::YUY2 }
 };
 
 void FreeMediaTypeFields(AM_MEDIA_TYPE& mt) noexcept {
@@ -96,7 +101,181 @@ LPWSTR DupWideStringCoTask(const wchar_t* src) {
     return out;
 }
 
-// Convierte y reescala un frame NV12 en CPU hacia un buffer NV12 destino con stride dstStride.
+struct BilinearTap {
+    uint32_t i0;
+    uint32_t i1;
+    uint16_t w1;
+    uint16_t w0;
+};
+
+struct BilinearScaleCache {
+    uint32_t srcW = 0;
+    uint32_t srcH = 0;
+    uint32_t dstW = 0;
+    uint32_t dstH = 0;
+    std::vector<BilinearTap> xLutY;
+    std::vector<BilinearTap> yLutY;
+    std::vector<BilinearTap> xLutUv;
+    std::vector<BilinearTap> yLutUv;
+};
+
+void ComputeAspectCropRect(
+    uint32_t srcW,
+    uint32_t srcH,
+    uint32_t dstW,
+    uint32_t dstH,
+    uint32_t& outCropX,
+    uint32_t& outCropY,
+    uint32_t& outCropW,
+    uint32_t& outCropH) noexcept {
+    outCropX = 0;
+    outCropY = 0;
+    outCropW = srcW;
+    outCropH = srcH;
+    if (srcW < 2u || srcH < 2u || dstW < 2u || dstH < 2u) return;
+
+    const uint64_t lhs = static_cast<uint64_t>(srcW) * dstH;
+    const uint64_t rhs = static_cast<uint64_t>(dstW) * srcH;
+    if (lhs > rhs) {
+        // Fuente más ancha (ej. 16:9 -> 4:3): recorte horizontal centrado con cotas pares.
+        uint32_t cw = static_cast<uint32_t>((rhs + dstH / 2u) / dstH) & ~1u;
+        cw = std::clamp(cw, 2u, srcW & ~1u);
+        outCropW = cw;
+        outCropX = ((srcW - cw) / 2u) & ~1u;
+    } else if (rhs > lhs) {
+        // Fuente más alta: recorte vertical centrado con cotas pares.
+        uint32_t ch = static_cast<uint32_t>((lhs + dstW / 2u) / dstW) & ~1u;
+        ch = std::clamp(ch, 2u, srcH & ~1u);
+        outCropH = ch;
+        outCropY = ((srcH - ch) / 2u) & ~1u;
+    }
+}
+
+void BuildBilinearLut(
+    uint32_t cropOffset,
+    uint32_t cropLen,
+    uint32_t dstLen,
+    uint32_t elemStride,
+    std::vector<BilinearTap>& lut) {
+    lut.resize(dstLen);
+    if (dstLen == 0u || cropLen == 0u) return;
+    if (cropLen == 1u) {
+        const uint32_t idx = cropOffset * elemStride;
+        for (uint32_t d = 0; d < dstLen; ++d) {
+            lut[d] = { idx, idx, 0u, 256u };
+        }
+        return;
+    }
+    const int64_t maxFp = static_cast<int64_t>(cropLen - 1u) << 8;
+    const uint32_t maxSample = cropOffset + cropLen - 1u;
+    for (uint32_t d = 0; d < dstLen; ++d) {
+        const int64_t fp = std::clamp<int64_t>(
+            ((2LL * static_cast<int64_t>(d) + 1LL) * static_cast<int64_t>(cropLen) * 128LL) /
+                static_cast<int64_t>(dstLen) - 128LL,
+            0LL,
+            maxFp);
+        const uint32_t base = cropOffset + static_cast<uint32_t>(fp >> 8);
+        const uint32_t next = std::min(maxSample, base + 1u);
+        const uint16_t w1 = static_cast<uint16_t>(fp & 0xFFLL);
+        lut[d] = { base * elemStride, next * elemStride, w1, static_cast<uint16_t>(256u - w1) };
+    }
+}
+
+void EnsureBilinearCache(
+    BilinearScaleCache& cache,
+    uint32_t srcW,
+    uint32_t srcH,
+    uint32_t dstW,
+    uint32_t dstH) {
+    if (cache.srcW == srcW && cache.srcH == srcH && cache.dstW == dstW && cache.dstH == dstH &&
+        cache.xLutY.size() == dstW && cache.yLutY.size() == dstH) {
+        return;
+    }
+    uint32_t cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+    ComputeAspectCropRect(srcW, srcH, dstW, dstH, cropX, cropY, cropW, cropH);
+    BuildBilinearLut(cropX, cropW, dstW, 1u, cache.xLutY);
+    BuildBilinearLut(cropY, cropH, dstH, 1u, cache.yLutY);
+    BuildBilinearLut(cropX / 2u, cropW / 2u, dstW / 2u, 2u, cache.xLutUv);
+    BuildBilinearLut(cropY / 2u, cropH / 2u, dstH / 2u, 1u, cache.yLutUv);
+    cache.srcW = srcW;
+    cache.srcH = srcH;
+    cache.dstW = dstW;
+    cache.dstH = dstH;
+}
+
+// Convierte y reescala (bilineal entero rápido) un frame NV12 CPU a I420 planar (nativo Discord/WebRTC).
+void WriteI420FromNv12Cpu(
+    const uint8_t* src,
+    uint32_t srcStride,
+    uint32_t srcW,
+    uint32_t srcH,
+    uint8_t* dst,
+    uint32_t dstStride,
+    uint32_t dstW,
+    uint32_t dstH,
+    BilinearScaleCache& cache) {
+    if (!src || !dst || srcW < 2u || srcH < 2u || dstW < 2u || dstH < 2u ||
+        (srcW & 1u) != 0u || (srcH & 1u) != 0u || (dstW & 1u) != 0u || (dstH & 1u) != 0u ||
+        (dstStride & 1u) != 0u || srcStride < srcW || dstStride < dstW) {
+        return;
+    }
+    const uint8_t* srcUv = src + static_cast<size_t>(srcStride) * srcH;
+    uint8_t* dstU = dst + static_cast<size_t>(dstStride) * dstH;
+    const uint32_t dstUvStride = dstStride / 2u;
+    uint8_t* dstV = dstU + static_cast<size_t>(dstUvStride) * (dstH / 2u);
+    const uint32_t dstPairsW = dstW / 2u;
+    const uint32_t dstPairsH = dstH / 2u;
+
+    if (srcW == dstW && srcH == dstH) {
+        for (uint32_t y = 0; y < dstH; ++y) {
+            std::memcpy(dst + static_cast<size_t>(y) * dstStride, src + static_cast<size_t>(y) * srcStride, dstW);
+        }
+        for (uint32_t cy = 0; cy < dstPairsH; ++cy) {
+            const uint8_t* sRow = srcUv + static_cast<size_t>(cy) * srcStride;
+            uint8_t* uRow = dstU + static_cast<size_t>(cy) * dstUvStride;
+            uint8_t* vRow = dstV + static_cast<size_t>(cy) * dstUvStride;
+            for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
+                const size_t sx = static_cast<size_t>(cx) * 2u;
+                uRow[cx] = sRow[sx];
+                vRow[cx] = sRow[sx + 1u];
+            }
+        }
+        return;
+    }
+
+    EnsureBilinearCache(cache, srcW, srcH, dstW, dstH);
+    for (uint32_t y = 0; y < dstH; ++y) {
+        const BilinearTap& yt = cache.yLutY[y];
+        const uint8_t* s0 = src + static_cast<size_t>(yt.i0) * srcStride;
+        const uint8_t* s1 = src + static_cast<size_t>(yt.i1) * srcStride;
+        uint8_t* dRow = dst + static_cast<size_t>(y) * dstStride;
+        for (uint32_t x = 0; x < dstW; ++x) {
+            const BilinearTap& xt = cache.xLutY[x];
+            const uint32_t top = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+            const uint32_t bot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+            dRow[x] = static_cast<uint8_t>((top * yt.w0 + bot * yt.w1 + 32768u) >> 16);
+        }
+    }
+
+    for (uint32_t cy = 0; cy < dstPairsH; ++cy) {
+        const BilinearTap& yt = cache.yLutUv[cy];
+        const uint8_t* s0 = srcUv + static_cast<size_t>(yt.i0) * srcStride;
+        const uint8_t* s1 = srcUv + static_cast<size_t>(yt.i1) * srcStride;
+        uint8_t* uRow = dstU + static_cast<size_t>(cy) * dstUvStride;
+        uint8_t* vRow = dstV + static_cast<size_t>(cy) * dstUvStride;
+        for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
+            const BilinearTap& xt = cache.xLutUv[cx];
+            const uint32_t uTop = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+            const uint32_t uBot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+            const uint32_t vTop = static_cast<uint32_t>(s0[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1 + 1u]) * xt.w1;
+            const uint32_t vBot = static_cast<uint32_t>(s1[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1 + 1u]) * xt.w1;
+            uRow[cx] = static_cast<uint8_t>((uTop * yt.w0 + uBot * yt.w1 + 32768u) >> 16);
+            vRow[cx] = static_cast<uint8_t>((vTop * yt.w0 + vBot * yt.w1 + 32768u) >> 16);
+        }
+    }
+}
+
+// Convierte y reescala (bilineal entero rápido) un frame NV12 en CPU hacia un buffer NV12 destino.
 void WriteNv12FromCpu(
     const uint8_t* src,
     uint32_t srcStride,
@@ -106,8 +285,7 @@ void WriteNv12FromCpu(
     uint32_t dstStride,
     uint32_t dstW,
     uint32_t dstH,
-    std::vector<uint32_t>& xMapY,
-    std::vector<uint32_t>& xMapUv) {
+    BilinearScaleCache& cache) {
     if (!src || !dst || srcW < 2u || srcH < 2u || dstW < 2u || dstH < 2u ||
         (srcW & 1u) != 0u || (srcH & 1u) != 0u || (dstW & 1u) != 0u || (dstH & 1u) != 0u ||
         srcStride < srcW || dstStride < dstW) {
@@ -132,45 +310,41 @@ void WriteNv12FromCpu(
         return;
     }
 
-    if (xMapY.size() != dstW) {
-        xMapY.resize(dstW);
-        for (uint32_t x = 0; x < dstW; ++x) {
-            xMapY[x] = std::min(srcW - 1u, static_cast<uint32_t>((static_cast<uint64_t>(x) * srcW) / dstW));
-        }
-    }
+    EnsureBilinearCache(cache, srcW, srcH, dstW, dstH);
     for (uint32_t y = 0; y < dstH; ++y) {
-        const uint32_t sy = std::min(srcH - 1u, static_cast<uint32_t>((static_cast<uint64_t>(y) * srcH) / dstH));
-        const uint8_t* sRow = src + static_cast<size_t>(sy) * srcStride;
+        const BilinearTap& yt = cache.yLutY[y];
+        const uint8_t* s0 = src + static_cast<size_t>(yt.i0) * srcStride;
+        const uint8_t* s1 = src + static_cast<size_t>(yt.i1) * srcStride;
         uint8_t* dRow = dst + static_cast<size_t>(y) * dstStride;
         for (uint32_t x = 0; x < dstW; ++x) {
-            dRow[x] = sRow[xMapY[x]];
+            const BilinearTap& xt = cache.xLutY[x];
+            const uint32_t top = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+            const uint32_t bot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+            dRow[x] = static_cast<uint8_t>((top * yt.w0 + bot * yt.w1 + 32768u) >> 16);
         }
     }
 
-    const uint32_t srcPairsW = std::max(1u, srcW / 2u);
-    const uint32_t srcPairsH = std::max(1u, srcH / 2u);
     const uint32_t dstPairsW = dstW / 2u;
     const uint32_t dstPairsH = dstH / 2u;
-    if (xMapUv.size() != dstPairsW) {
-        xMapUv.resize(dstPairsW);
-        for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-            xMapUv[cx] = std::min(srcPairsW - 1u, static_cast<uint32_t>((static_cast<uint64_t>(cx) * srcPairsW) / std::max(1u, dstPairsW))) * 2u;
-        }
-    }
     for (uint32_t cy = 0; cy < dstPairsH; ++cy) {
-        const uint32_t sy = std::min(srcPairsH - 1u, static_cast<uint32_t>((static_cast<uint64_t>(cy) * srcPairsH) / std::max(1u, dstPairsH)));
-        const uint8_t* sRow = srcUv + static_cast<size_t>(sy) * srcStride;
+        const BilinearTap& yt = cache.yLutUv[cy];
+        const uint8_t* s0 = srcUv + static_cast<size_t>(yt.i0) * srcStride;
+        const uint8_t* s1 = srcUv + static_cast<size_t>(yt.i1) * srcStride;
         uint8_t* dRow = dstUv + static_cast<size_t>(cy) * dstStride;
         for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-            const size_t sx = xMapUv[cx];
+            const BilinearTap& xt = cache.xLutUv[cx];
             const size_t dx = static_cast<size_t>(cx) * 2u;
-            dRow[dx] = sRow[sx];
-            dRow[dx + 1u] = sRow[sx + 1u];
+            const uint32_t uTop = static_cast<uint32_t>(s0[xt.i0]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1]) * xt.w1;
+            const uint32_t uBot = static_cast<uint32_t>(s1[xt.i0]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1]) * xt.w1;
+            const uint32_t vTop = static_cast<uint32_t>(s0[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s0[xt.i1 + 1u]) * xt.w1;
+            const uint32_t vBot = static_cast<uint32_t>(s1[xt.i0 + 1u]) * xt.w0 + static_cast<uint32_t>(s1[xt.i1 + 1u]) * xt.w1;
+            dRow[dx] = static_cast<uint8_t>((uTop * yt.w0 + uBot * yt.w1 + 32768u) >> 16);
+            dRow[dx + 1u] = static_cast<uint8_t>((vTop * yt.w0 + vBot * yt.w1 + 32768u) >> 16);
         }
     }
 }
 
-// Convierte y reescala un frame NV12 en CPU directamente a YUY2 empaquetado (Y0, U, Y1, V).
+// Convierte y reescala (bilineal por píxel en luma + croma bilineal) NV12 CPU a YUY2 empaquetado.
 void WriteYuy2FromNv12Cpu(
     const uint8_t* src,
     uint32_t srcStride,
@@ -180,7 +354,7 @@ void WriteYuy2FromNv12Cpu(
     uint32_t dstStrideBytes,
     uint32_t dstW,
     uint32_t dstH,
-    std::vector<uint32_t>& xMapPairs) {
+    BilinearScaleCache& cache) {
     if (!src || !dst || srcW < 2u || srcH < 2u || dstW < 2u || dstH < 2u ||
         (srcW & 1u) != 0u || (srcH & 1u) != 0u || (dstW & 1u) != 0u || (dstH & 1u) != 0u ||
         srcStride < srcW || dstStrideBytes < dstW * 2u) {
@@ -206,33 +380,42 @@ void WriteYuy2FromNv12Cpu(
         return;
     }
 
-    const uint32_t srcPairsW = std::max(1u, srcW / 2u);
-    if (xMapPairs.size() != dstPairsW) {
-        xMapPairs.resize(dstPairsW);
-        for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-            xMapPairs[cx] = std::min(srcPairsW - 1u, static_cast<uint32_t>((static_cast<uint64_t>(cx) * srcPairsW) / std::max(1u, dstPairsW))) * 2u;
-        }
-    }
-
+    EnsureBilinearCache(cache, srcW, srcH, dstW, dstH);
     for (uint32_t y = 0; y < dstH; ++y) {
-        const uint32_t sy = std::min(srcH - 1u, static_cast<uint32_t>((static_cast<uint64_t>(y) * srcH) / dstH));
-        const uint8_t* sY = src + static_cast<size_t>(sy) * srcStride;
-        const uint8_t* sUv = srcUv + static_cast<size_t>(sy >> 1u) * srcStride;
+        const BilinearTap& yt = cache.yLutY[y];
+        const BilinearTap& yuvt = cache.yLutUv[y >> 1u];
+        const uint8_t* sY0 = src + static_cast<size_t>(yt.i0) * srcStride;
+        const uint8_t* sY1 = src + static_cast<size_t>(yt.i1) * srcStride;
+        const uint8_t* sUv0 = srcUv + static_cast<size_t>(yuvt.i0) * srcStride;
+        const uint8_t* sUv1 = srcUv + static_cast<size_t>(yuvt.i1) * srcStride;
         uint8_t* dRow = dst + static_cast<size_t>(y) * dstStrideBytes;
         for (uint32_t cx = 0; cx < dstPairsW; ++cx) {
-            const size_t sx = xMapPairs[cx];
+            const BilinearTap& xt0 = cache.xLutY[cx * 2u];
+            const BilinearTap& xt1 = cache.xLutY[cx * 2u + 1u];
+            const BilinearTap& xuv = cache.xLutUv[cx];
+
+            const uint32_t y0Top = static_cast<uint32_t>(sY0[xt0.i0]) * xt0.w0 + static_cast<uint32_t>(sY0[xt0.i1]) * xt0.w1;
+            const uint32_t y0Bot = static_cast<uint32_t>(sY1[xt0.i0]) * xt0.w0 + static_cast<uint32_t>(sY1[xt0.i1]) * xt0.w1;
+            const uint32_t y1Top = static_cast<uint32_t>(sY0[xt1.i0]) * xt1.w0 + static_cast<uint32_t>(sY0[xt1.i1]) * xt1.w1;
+            const uint32_t y1Bot = static_cast<uint32_t>(sY1[xt1.i0]) * xt1.w0 + static_cast<uint32_t>(sY1[xt1.i1]) * xt1.w1;
+
+            const uint32_t uTop = static_cast<uint32_t>(sUv0[xuv.i0]) * xuv.w0 + static_cast<uint32_t>(sUv0[xuv.i1]) * xuv.w1;
+            const uint32_t uBot = static_cast<uint32_t>(sUv1[xuv.i0]) * xuv.w0 + static_cast<uint32_t>(sUv1[xuv.i1]) * xuv.w1;
+            const uint32_t vTop = static_cast<uint32_t>(sUv0[xuv.i0 + 1u]) * xuv.w0 + static_cast<uint32_t>(sUv0[xuv.i1 + 1u]) * xuv.w1;
+            const uint32_t vBot = static_cast<uint32_t>(sUv1[xuv.i0 + 1u]) * xuv.w0 + static_cast<uint32_t>(sUv1[xuv.i1 + 1u]) * xuv.w1;
+
             const size_t dx = static_cast<size_t>(cx) * 4u;
-            dRow[dx] = sY[sx];
-            dRow[dx + 1u] = sUv[sx];
-            dRow[dx + 2u] = sY[sx + 1u];
-            dRow[dx + 3u] = sUv[sx + 1u];
+            dRow[dx] = static_cast<uint8_t>((y0Top * yt.w0 + y0Bot * yt.w1 + 32768u) >> 16);
+            dRow[dx + 1u] = static_cast<uint8_t>((uTop * yuvt.w0 + uBot * yuvt.w1 + 32768u) >> 16);
+            dRow[dx + 2u] = static_cast<uint8_t>((y1Top * yt.w0 + y1Bot * yt.w1 + 32768u) >> 16);
+            dRow[dx + 3u] = static_cast<uint8_t>((vTop * yuvt.w0 + vBot * yuvt.w1 + 32768u) >> 16);
         }
     }
 }
 
-void FillStandbyFrame(uint8_t* dst, UINT32 dstW, UINT32 dstH, UINT32 dstStridePixels, bool yuy2) noexcept {
+void FillStandbyFrame(uint8_t* dst, UINT32 dstW, UINT32 dstH, UINT32 dstStridePixels, DShowPixelFmt fmt) noexcept {
     if (!dst || dstW == 0 || dstH == 0) return;
-    if (yuy2) {
+    if (fmt == DShowPixelFmt::YUY2) {
         const uint32_t rowStride = std::max(dstW, dstStridePixels) * 2u;
         const uint32_t words = dstW / 2u;
         for (UINT32 y = 0; y < dstH; ++y) {
@@ -240,6 +423,20 @@ void FillStandbyFrame(uint8_t* dst, UINT32 dstW, UINT32 dstH, UINT32 dstStridePi
             for (uint32_t x = 0; x < words; ++x) {
                 row[x] = 0x80108010u; // Y0=16, U=128, Y1=16, V=128 (little-endian)
             }
+        }
+    } else if (fmt == DShowPixelFmt::I420) {
+        const uint32_t stride = std::max(dstW, dstStridePixels);
+        for (UINT32 y = 0; y < dstH; ++y) {
+            std::memset(dst + static_cast<size_t>(y) * stride, 16, dstW);
+        }
+        const uint32_t uvStride = stride / 2u;
+        const uint32_t uvW = dstW / 2u;
+        const uint32_t uvH = dstH / 2u;
+        uint8_t* uPlane = dst + static_cast<size_t>(stride) * dstH;
+        uint8_t* vPlane = uPlane + static_cast<size_t>(uvStride) * uvH;
+        for (UINT32 y = 0; y < uvH; ++y) {
+            std::memset(uPlane + static_cast<size_t>(y) * uvStride, 128, uvW);
+            std::memset(vPlane + static_cast<size_t>(y) * uvStride, 128, uvW);
         }
     } else {
         const uint32_t stride = std::max(dstW, dstStridePixels);
@@ -430,7 +627,8 @@ HRESULT ZeroCamDShowPin::CreateModeMediaType(size_t index, AM_MEDIA_TYPE** ppmt)
     }
     std::memset(vih, 0, sizeof(VIDEOINFOHEADER));
 
-    const DWORD imgSize = m.yuy2 ? (m.w * m.h * 2u) : (m.w * m.h * 3u / 2u);
+    const bool isYuy2 = (m.fmt == DShowPixelFmt::YUY2);
+    const DWORD imgSize = isYuy2 ? (m.w * m.h * 2u) : (m.w * m.h * 3u / 2u);
     vih->rcSource = { 0, 0, static_cast<LONG>(m.w), static_cast<LONG>(m.h) };
     vih->rcTarget = { 0, 0, static_cast<LONG>(m.w), static_cast<LONG>(m.h) };
     vih->AvgTimePerFrame = 10000000LL / static_cast<REFERENCE_TIME>(m.fps);
@@ -439,12 +637,20 @@ HRESULT ZeroCamDShowPin::CreateModeMediaType(size_t index, AM_MEDIA_TYPE** ppmt)
     vih->bmiHeader.biWidth = static_cast<LONG>(m.w);
     vih->bmiHeader.biHeight = static_cast<LONG>(m.h);
     vih->bmiHeader.biPlanes = 1;
-    vih->bmiHeader.biBitCount = m.yuy2 ? 16 : 12;
-    vih->bmiHeader.biCompression = m.yuy2 ? MAKEFOURCC('Y', 'U', 'Y', '2') : MAKEFOURCC('N', 'V', '1', '2');
+    vih->bmiHeader.biBitCount = isYuy2 ? 16 : 12;
+    if (m.fmt == DShowPixelFmt::I420) {
+        vih->bmiHeader.biCompression = MAKEFOURCC('I', '4', '2', '0');
+        mt->subtype = kMediaSubtypeI420;
+    } else if (m.fmt == DShowPixelFmt::NV12) {
+        vih->bmiHeader.biCompression = MAKEFOURCC('N', 'V', '1', '2');
+        mt->subtype = MEDIASUBTYPE_NV12;
+    } else {
+        vih->bmiHeader.biCompression = MAKEFOURCC('Y', 'U', 'Y', '2');
+        mt->subtype = MEDIASUBTYPE_YUY2;
+    }
     vih->bmiHeader.biSizeImage = imgSize;
 
     mt->majortype = MEDIATYPE_Video;
-    mt->subtype = m.yuy2 ? MEDIASUBTYPE_YUY2 : MEDIASUBTYPE_NV12;
     mt->bFixedSizeSamples = TRUE;
     mt->bTemporalCompression = FALSE;
     mt->lSampleSize = imgSize;
@@ -459,11 +665,12 @@ bool ZeroCamDShowPin::ExtractFormatParams(
     const AM_MEDIA_TYPE* pmt,
     UINT32& outW,
     UINT32& outH,
-    bool& outYuy2,
+    DShowPixelFmt& outFmt,
     REFERENCE_TIME& outAvgTimePerFrame) noexcept {
     if (!pmt || pmt->majortype != MEDIATYPE_Video || !pmt->pbFormat) return false;
-    if (pmt->subtype == MEDIASUBTYPE_NV12) outYuy2 = false;
-    else if (pmt->subtype == MEDIASUBTYPE_YUY2) outYuy2 = true;
+    if (pmt->subtype == kMediaSubtypeI420 || pmt->subtype == MEDIASUBTYPE_IYUV) outFmt = DShowPixelFmt::I420;
+    else if (pmt->subtype == MEDIASUBTYPE_NV12) outFmt = DShowPixelFmt::NV12;
+    else if (pmt->subtype == MEDIASUBTYPE_YUY2) outFmt = DShowPixelFmt::YUY2;
     else return false;
 
     BITMAPINFOHEADER bmi{};
@@ -546,9 +753,9 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
         if (pmt->majortype != MEDIATYPE_Video) return VFW_E_TYPE_NOT_ACCEPTED;
         if (pmt->formattype != GUID_NULL && pmt->pbFormat != nullptr) {
             UINT32 w = 0, h = 0;
-            bool yuy2 = false;
+            DShowPixelFmt fmt = DShowPixelFmt::I420;
             REFERENCE_TIME avg = 0;
-            if (!ExtractFormatParams(pmt, w, h, yuy2, avg)) {
+            if (!ExtractFormatParams(pmt, w, h, fmt, avg)) {
                 return VFW_E_TYPE_NOT_ACCEPTED;
             }
             if (AM_MEDIA_TYPE* copy = CloneMediaTypePtr(*pmt)) {
@@ -584,9 +791,9 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
             continue;
         }
         UINT32 w = 1280, h = 720;
-        bool yuy2 = false;
+        DShowPixelFmt fmt = DShowPixelFmt::I420;
         REFERENCE_TIME avg = 333333;
-        if (!ExtractFormatParams(cand, w, h, yuy2, avg)) {
+        if (!ExtractFormatParams(cand, w, h, fmt, avg)) {
             pReceivePin->Disconnect();
             continue;
         }
@@ -599,7 +806,7 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
             }
         }
 
-        const size_t minFrameBytes = yuy2
+        const size_t minFrameBytes = (fmt == DShowPixelFmt::YUY2)
             ? (static_cast<size_t>(w) * h * 2u)
             : (static_cast<size_t>(w) * h * 3u / 2u);
         const long bufSize = static_cast<long>(std::max<size_t>(cand->lSampleSize, minFrameBytes));
@@ -635,7 +842,7 @@ IFACEMETHODIMP ZeroCamDShowPin::Connect(IPin* pReceivePin, const AM_MEDIA_TYPE* 
         allocator_ = alloc;
         fmtWidth_ = w;
         fmtHeight_ = h;
-        fmtIsYuy2_ = yuy2;
+        fmtPixel_ = fmt;
         fmtAvgTime_ = avg;
         clearCandidates();
         return S_OK;
@@ -704,9 +911,9 @@ IFACEMETHODIMP ZeroCamDShowPin::QueryId(LPWSTR* Id) {
 
 IFACEMETHODIMP ZeroCamDShowPin::QueryAccept(const AM_MEDIA_TYPE* pmt) {
     UINT32 w = 0, h = 0;
-    bool yuy2 = false;
+    DShowPixelFmt fmt = DShowPixelFmt::I420;
     REFERENCE_TIME avg = 0;
-    return ExtractFormatParams(pmt, w, h, yuy2, avg) ? S_OK : S_FALSE;
+    return ExtractFormatParams(pmt, w, h, fmt, avg) ? S_OK : S_FALSE;
 }
 
 IFACEMETHODIMP ZeroCamDShowPin::EnumMediaTypes(IEnumMediaTypes** ppEnum) {
@@ -728,9 +935,9 @@ IFACEMETHODIMP ZeroCamDShowPin::SetFormat(AM_MEDIA_TYPE* pmt) {
     if (!filter_->IsStopped()) return VFW_E_NOT_STOPPED;
 
     UINT32 w = 0, h = 0;
-    bool yuy2 = false;
+    DShowPixelFmt fmt = DShowPixelFmt::I420;
     REFERENCE_TIME avg = 0;
-    if (!ExtractFormatParams(pmt, w, h, yuy2, avg)) {
+    if (!ExtractFormatParams(pmt, w, h, fmt, avg)) {
         return VFW_E_INVALIDMEDIATYPE;
     }
     if (connectedPin_ && connectedPin_->QueryAccept(pmt) != S_OK) {
@@ -742,7 +949,7 @@ IFACEMETHODIMP ZeroCamDShowPin::SetFormat(AM_MEDIA_TYPE* pmt) {
     hasCurrentMt_ = true;
     fmtWidth_ = w;
     fmtHeight_ = h;
-    fmtIsYuy2_ = yuy2;
+    fmtPixel_ = fmt;
     fmtAvgTime_ = avg;
     return S_OK;
 }
@@ -831,7 +1038,7 @@ HRESULT ZeroCamDShowPin::StartStreaming() {
     Microsoft::WRL::ComPtr<IMemAllocator> alloc;
     Microsoft::WRL::ComPtr<IMemInputPin> memIn;
     UINT32 w = 1280, h = 720;
-    bool yuy2 = false;
+    DShowPixelFmt fmt = DShowPixelFmt::I420;
     REFERENCE_TIME avg = 333333;
     {
         std::lock_guard<std::mutex> lock(lock_);
@@ -842,7 +1049,7 @@ HRESULT ZeroCamDShowPin::StartStreaming() {
         memIn = memInputPin_;
         w = fmtWidth_;
         h = fmtHeight_;
-        yuy2 = fmtIsYuy2_;
+        fmt = fmtPixel_;
         avg = fmtAvgTime_;
     }
 
@@ -851,7 +1058,7 @@ HRESULT ZeroCamDShowPin::StartStreaming() {
 
     stopRequested_.store(false, std::memory_order_release);
     flushing_.store(false, std::memory_order_release);
-    pushThread_ = std::thread(&ZeroCamDShowPin::PushThreadMain, this, w, h, yuy2, avg);
+    pushThread_ = std::thread(&ZeroCamDShowPin::PushThreadMain, this, w, h, fmt, avg);
     return S_OK;
 }
 
@@ -871,7 +1078,7 @@ void ZeroCamDShowPin::StopStreaming() {
     }
 }
 
-void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REFERENCE_TIME frameDurHns) {
+void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, DShowPixelFmt dstFmt, REFERENCE_TIME frameDurHns) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     Microsoft::WRL::ComPtr<IMemAllocator> alloc;
@@ -900,9 +1107,7 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
         paceTimer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     }
 
-    std::vector<uint32_t> xMapY;
-    std::vector<uint32_t> xMapUv;
-    std::vector<uint32_t> xMapYuy2;
+    BilinearScaleCache scaleCache;
     uint64_t lastSeq = 0;
     ULONGLONG lastDeliverMs = 0;
     LARGE_INTEGER qpcFreq{}, qpcStart{};
@@ -968,9 +1173,9 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
         AM_MEDIA_TYPE* dynMt = nullptr;
         if (sample->GetMediaType(&dynMt) == S_OK && dynMt) {
             UINT32 dw = 0, dh = 0;
-            bool dy = false;
+            DShowPixelFmt dfmt = dstFmt;
             REFERENCE_TIME davg = 0;
-            if (ExtractFormatParams(dynMt, dw, dh, dy, davg) && dw >= dstW) {
+            if (ExtractFormatParams(dynMt, dw, dh, dfmt, davg) && dw >= dstW) {
                 sampleStridePx = dw;
             }
             DeleteMediaTypePtr(dynMt);
@@ -978,7 +1183,7 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
 
         BYTE* dstPtr = nullptr;
         const long bufCapacity = sample->GetSize();
-        const size_t minNeeded = dstYuy2
+        const size_t minNeeded = (dstFmt == DShowPixelFmt::YUY2)
             ? static_cast<size_t>(std::max(dstW, sampleStridePx)) * dstH * 2u
             : static_cast<size_t>(std::max(dstW, sampleStridePx)) * dstH * 3u / 2u;
 
@@ -990,20 +1195,24 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, bool dstYuy2, REF
                 uint32_t mw = 0, mh = 0, mStride = 0, mSlot = 0;
                 if (UnpackCpuFrameMeta(meta, mw, mh, mStride, mSlot)) {
                     const uint32_t stridePx = std::max(dstW, sampleStridePx);
-                    if (dstYuy2) {
+                    if (dstFmt == DShowPixelFmt::I420) {
+                        WriteI420FromNv12Cpu(
+                            mem->cpuNv12Buffer[mSlot], mStride, mw, mh,
+                            dstPtr, stridePx, dstW, dstH, scaleCache);
+                    } else if (dstFmt == DShowPixelFmt::YUY2) {
                         WriteYuy2FromNv12Cpu(
                             mem->cpuNv12Buffer[mSlot], mStride, mw, mh,
-                            dstPtr, stridePx * 2u, dstW, dstH, xMapYuy2);
+                            dstPtr, stridePx * 2u, dstW, dstH, scaleCache);
                     } else {
                         WriteNv12FromCpu(
                             mem->cpuNv12Buffer[mSlot], mStride, mw, mh,
-                            dstPtr, stridePx, dstW, dstH, xMapY, xMapUv);
+                            dstPtr, stridePx, dstW, dstH, scaleCache);
                     }
                     wroteLive = true;
                 }
             }
             if (!wroteLive) {
-                FillStandbyFrame(dstPtr, dstW, dstH, sampleStridePx, dstYuy2);
+                FillStandbyFrame(dstPtr, dstW, dstH, sampleStridePx, dstFmt);
             }
             sample->SetActualDataLength(static_cast<long>(minNeeded));
         }

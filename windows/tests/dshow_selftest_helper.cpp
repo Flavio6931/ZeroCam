@@ -100,12 +100,25 @@ public:
         const long len = pSample->GetActualDataLength();
         if (SUCCEEDED(pSample->GetPointer(&ptr)) && ptr && len > 0) {
             std::lock_guard<std::mutex> lk(mu_);
-            const size_t idx = (expectedSubtype_ == MEDIASUBTYPE_YUY2)
-                ? ((static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u)) * 2u
-                : ((static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u));
-            if (idx + 3u < static_cast<size_t>(len)) {
-                lastCenterY_.store(ptr[idx], std::memory_order_release);
-                lastCenterU_.store(ptr[idx + 1u], std::memory_order_release);
+            if (expectedSubtype_ == kMediaSubtypeI420) {
+                const size_t yIdx = (static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u);
+                const size_t yPlane = static_cast<size_t>(w_) * h_;
+                const size_t uPlane = yPlane / 4u;
+                const size_t uIdx = yPlane + (static_cast<size_t>(h_) / 4u) * (w_ / 2u) + (w_ / 4u);
+                const size_t vIdx = uIdx + uPlane;
+                if (vIdx < static_cast<size_t>(len)) {
+                    lastCenterY_.store(ptr[yIdx], std::memory_order_release);
+                    lastCenterU_.store(ptr[uIdx], std::memory_order_release);
+                    lastCenterV_.store(ptr[vIdx], std::memory_order_release);
+                }
+            } else {
+                const size_t idx = (expectedSubtype_ == MEDIASUBTYPE_YUY2)
+                    ? ((static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u)) * 2u
+                    : ((static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u));
+                if (idx + 3u < static_cast<size_t>(len)) {
+                    lastCenterY_.store(ptr[idx], std::memory_order_release);
+                    lastCenterU_.store(ptr[idx + 1u], std::memory_order_release);
+                }
             }
             lastLen_.store(len, std::memory_order_release);
             frames_.fetch_add(1, std::memory_order_release);
@@ -126,6 +139,7 @@ public:
     long LastLen() const noexcept { return lastLen_.load(std::memory_order_acquire); }
     uint8_t LastY() const noexcept { return lastCenterY_.load(std::memory_order_acquire); }
     uint8_t LastU() const noexcept { return lastCenterU_.load(std::memory_order_acquire); }
+    uint8_t LastV() const noexcept { return lastCenterV_.load(std::memory_order_acquire); }
 
 private:
     std::atomic<ULONG> refs_{ 1 };
@@ -139,6 +153,7 @@ private:
     std::atomic<long> lastLen_{ 0 };
     std::atomic<uint8_t> lastCenterY_{ 0 };
     std::atomic<uint8_t> lastCenterU_{ 0 };
+    std::atomic<uint8_t> lastCenterV_{ 0 };
 };
 
 } // namespace
@@ -180,13 +195,14 @@ void RunDShowSelfTests(
 
             Microsoft::WRL::ComPtr<IAMStreamConfig> scfg;
             int capCount = 0, capSize = 0;
-            bool hasYuy2Cap = false, hasNv12Cap = false;
+            bool hasI420Cap = false, hasYuy2Cap = false, hasNv12Cap = false;
+            AM_MEDIA_TYPE* i420Mt = nullptr;
             AM_MEDIA_TYPE* yuy2Mt = nullptr;
             AM_MEDIA_TYPE* nv12Mt = nullptr;
 
             if (ksOk && SUCCEEDED(outPin.As(&scfg)) &&
                 SUCCEEDED(scfg->GetNumberOfCapabilities(&capCount, &capSize)) &&
-                capCount >= 10 && capSize == sizeof(VIDEO_STREAM_CONFIG_CAPS)) {
+                capCount >= 15 && capSize == sizeof(VIDEO_STREAM_CONFIG_CAPS)) {
                 std::vector<BYTE> sccBuf(static_cast<size_t>(capSize));
                 for (int i = 0; i < capCount; ++i) {
                     AM_MEDIA_TYPE* cmt = nullptr;
@@ -194,6 +210,11 @@ void RunDShowSelfTests(
                         if (cmt->formattype == FORMAT_VideoInfo && cmt->cbFormat >= sizeof(VIDEOINFOHEADER) && cmt->pbFormat) {
                             const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(cmt->pbFormat);
                             if (vih->bmiHeader.biWidth == 1280 && vih->bmiHeader.biHeight == 720) {
+                                if (cmt->subtype == kMediaSubtypeI420 && !i420Mt) {
+                                    i420Mt = cmt;
+                                    hasI420Cap = true;
+                                    continue;
+                                }
                                 if (cmt->subtype == MEDIASUBTYPE_YUY2 && !yuy2Mt) {
                                     yuy2Mt = cmt;
                                     hasYuy2Cap = true;
@@ -211,9 +232,45 @@ void RunDShowSelfTests(
                     }
                 }
             }
-            outMetaOk = ksOk && hasYuy2Cap && hasNv12Cap;
+            outMetaOk = ksOk && hasI420Cap && hasYuy2Cap && hasNv12Cap;
 
             ZeroCamSharedMemory* ipc = d3dCtx.Ipc();
+            bool i420BilinearOk = false;
+            if (ipc && i420Mt && SUCCEEDED(scfg->SetFormat(i420Mt))) {
+                // Patrón 1080p de columnas alternas Y=40/220 para verificar promedio bilineal 1080p->720p en I420.
+                for (uint32_t row = 0; row < 1080u; ++row) {
+                    uint8_t* line = ipc->cpuNv12Buffer[0] + static_cast<size_t>(row) * 1920u;
+                    for (uint32_t col = 0; col < 1920u; ++col) {
+                        line[col] = (col & 1u) ? 220u : 40u;
+                    }
+                }
+                uint8_t* uvBase = ipc->cpuNv12Buffer[0] + static_cast<size_t>(1920u) * 1080u;
+                for (size_t i = 0; i < (static_cast<size_t>(1920u) * 1080u) / 4u; ++i) {
+                    uvBase[i * 2u] = 110u;
+                    uvBase[i * 2u + 1u] = 150u;
+                }
+                ipc->cpuFrameMeta.store(PackCpuFrameMeta(1920, 1080, 1920, 0), std::memory_order_release);
+                ipc->frameSequence.fetch_add(1, std::memory_order_release);
+                d3dCtx.SetProducerActive(true);
+
+                Microsoft::WRL::ComPtr<MockDShowSinkPin> sinkI420;
+                sinkI420.Attach(new MockDShowSinkPin(kMediaSubtypeI420, 1280, 720));
+                if (SUCCEEDED(outPin->Connect(sinkI420.Get(), i420Mt)) && SUCCEEDED(dsFilter->Run(0))) {
+                    for (int w = 0; w < 40 && sinkI420->Frames() < 2u; ++w) {
+                        Sleep(25);
+                    }
+                    const uint8_t yMid = sinkI420->LastY();
+                    i420BilinearOk = (sinkI420->Frames() >= 2u &&
+                                      sinkI420->LastLen() == (1280L * 720L * 3L) / 2L &&
+                                      yMid >= 70u && yMid <= 190u &&
+                                      sinkI420->LastU() == 110u &&
+                                      sinkI420->LastV() == 150u);
+                    dsFilter->Stop();
+                    outPin->Disconnect();
+                    sinkI420->Disconnect();
+                }
+            }
+
             if (ipc && yuy2Mt && SUCCEEDED(scfg->SetFormat(yuy2Mt))) {
                 std::memset(ipc->cpuNv12Buffer[0], 180, static_cast<size_t>(1280) * 720);
                 std::memset(ipc->cpuNv12Buffer[0] + static_cast<size_t>(1280) * 720, 128, (static_cast<size_t>(1280) * 720) / 2);
@@ -231,7 +288,8 @@ void RunDShowSelfTests(
                         for (int w = 0; w < 40 && sinkYuy2->Frames() < 2u; ++w) {
                             Sleep(25);
                         }
-                        outYuy2Ok = (pauseCantCueOk &&
+                        outYuy2Ok = (i420BilinearOk &&
+                                     pauseCantCueOk &&
                                      sinkYuy2->Frames() >= 2u &&
                                      sinkYuy2->LastLen() == 1280L * 720L * 2L &&
                                      sinkYuy2->LastY() >= 175 && sinkYuy2->LastY() <= 185 &&
@@ -272,6 +330,10 @@ void RunDShowSelfTests(
                 }
             }
 
+            if (i420Mt) {
+                if (i420Mt->pbFormat) CoTaskMemFree(i420Mt->pbFormat);
+                CoTaskMemFree(i420Mt);
+            }
             if (yuy2Mt) {
                 if (yuy2Mt->pbFormat) CoTaskMemFree(yuy2Mt->pbFormat);
                 CoTaskMemFree(yuy2Mt);

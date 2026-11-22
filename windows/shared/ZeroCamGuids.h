@@ -26,6 +26,11 @@ static constexpr GUID kKsCategoryCapture = {
     0x65e8773d, 0x8f56, 0x11d0, { 0xa3, 0xb9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96 }
 };
 
+// Subtipo DirectShow MEDIASUBTYPE_I420 ('I420', no incluido en uuids.h del SDK de Windows), nativo de WebRTC/Discord.
+static constexpr GUID kMediaSubtypeI420 = {
+    0x30323449, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 }
+};
+
 // Constantes de identidad e IPC compartidas entre el productor (ZeroCam.exe) y los servidores COM.
 inline constexpr const wchar_t* kZeroCamClsidString      = L"{8F4A9C12-6E3B-4D71-9A25-3C8E71B40D62}";
 inline constexpr const wchar_t* kZeroCamDShowClsidString = L"{6E3C7B24-1F89-4A52-B4C1-9D2E5F8A3107}";
