@@ -2,6 +2,11 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.2.5] - 2026-11-21
+### Mejorado
+- **Minimizar directo a bandeja del sistema (`MainWindow`):** pulsar el botón `—` (`SC_MINIMIZE`) oculta la ventana directamente al icono del área de notificación y detiene el renderizado de vista previa (`0.0% GPU 3D`) manteniendo activa la cámara virtual.
+- **Restauración rápida con 1 clic:** un clic izquierdo (`WM_LBUTTONUP`) o doble clic en el icono de bandeja restaura la ventana preservando su estado previo (normal o maximizado).
+
 ## [1.2.4] - 2026-11-21
 ### Mejorado
 - **UI Windows sin congelamientos (`MainWindow`):** ciclo de vida de cámara virtual (`MFCreateVirtualCamera`), motor de ingesta (`StreamIngest`), registro elevado y reconexión USB movidos a un hilo trabajador MTA dedicado con indicadores transitorios inmediatos (`Iniciando...`, `Deteniendo...`, `Actualizando...`).

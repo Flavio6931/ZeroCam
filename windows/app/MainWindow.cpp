@@ -122,7 +122,7 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     hwnd_ = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"ZeroCam v1.2.4 — Cámara Virtual Zero-Copy",
+        L"ZeroCam v1.2.5 — Cámara Virtual Zero-Copy",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
         nullptr, nullptr, hInstance_, this);
@@ -1063,7 +1063,9 @@ void MainWindow::MinimizeToTray() {
 
 void MainWindow::RestoreFromTray() {
     ShowWindow(hwnd_, SW_SHOW);
-    ShowWindow(hwnd_, SW_RESTORE);
+    if (IsIconic(hwnd_)) {
+        ShowWindow(hwnd_, SW_RESTORE);
+    }
     SetForegroundWindow(hwnd_);
     preview_.SetEnabled(userPreviewWanted_);
     if (previewHost_) InvalidateRect(previewHost_, nullptr, FALSE);
@@ -1111,6 +1113,13 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     }
+
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xFFF0) == SC_MINIMIZE && trayAdded_) {
+            MinimizeToTray();
+            return 0;
+        }
+        break;
 
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
@@ -1313,7 +1322,7 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case kWmTrayCallback:
-        if (lParam == WM_LBUTTONDBLCLK) RestoreFromTray();
+        if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) RestoreFromTray();
         else if (lParam == WM_RBUTTONUP) ShowTrayMenu();
         return 0;
 
