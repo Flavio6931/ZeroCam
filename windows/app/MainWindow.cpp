@@ -123,7 +123,7 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     hwnd_ = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"ZeroCam v1.3.4 — Cámara Virtual Zero-Copy",
+        L"ZeroCam v1.3.5 — Cámara Virtual Zero-Copy",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
         nullptr, nullptr, hInstance_, this);

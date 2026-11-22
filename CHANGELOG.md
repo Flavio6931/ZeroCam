@@ -2,6 +2,12 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.5] - 2026-11-21
+### Corregido
+- **Instalador sin aviso de reinicio de Windows tras reemplazo en caliente de DLL:**
+  - `CopyAndHardenDll()` (`windows/app/VirtualCameraHost.cpp`) deja de llamar a `MoveFileExW(..., nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)` sobre backups `.old.*` cuando Discord/OBS mantiene abierta una DLL anterior; `CleanupStaleOldDlls()` limpia los `.old*` residuales en arranques o desinstalaciones posteriores sin ensuciar `PendingFileRenameOperations`.
+  - `installer/ZeroCam.iss` añade `RestartIfNeededByRun=no` para suprimir el cuadro final *"su sistema debe reiniciarse"* al completar la instalación.
+
 ## [1.3.4] - 2026-11-21
 ### Corregido
 - **Fluidez real a 30/60 fps en Discord (sin tirones a ~15 fps):**

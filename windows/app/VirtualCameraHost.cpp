@@ -307,11 +307,11 @@ bool CopyAndHardenDll(const std::wstring& srcPath, const std::wstring& dstPath) 
         Sleep(100);
     }
     if (!copied && IsExistingRegularFile(dstPath)) {
-        // Si otro proceso (Discord/OBS) tiene mapeada la DLL en uso, renombra el bloqueo a .old.* y escribe la nueva.
+        // Si otro proceso (Discord/OBS) tiene mapeada la DLL en uso, renombra el bloqueo a .old.* y escribe la nueva;
+        // CleanupStaleOldDlls limpiara los .old* sin registrar MOVEFILE_DELAY_UNTIL_REBOOT (evita pedir reinicio en Inno Setup).
         const std::wstring oldPath = dstPath + L".old." + std::to_wstring(GetTickCount64());
         if (!IsPathReparsePoint(oldPath) &&
             MoveFileExW(dstPath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-            MoveFileExW(oldPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
             for (int tries = 0; tries < 5; ++tries) {
                 if (CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE)) {
                     copied = true;
