@@ -114,7 +114,8 @@ bool MfHwDecoder::DecodeAccessUnit(
     int64_t ptsUs,
     uint32_t fpsNum,
     uint32_t fpsDen,
-    uint8_t rotationCode) {
+    uint8_t rotationCode,
+    bool skipPublish) {
     if (!initialized_ || !decoder_ || !data || size == 0) return false;
     currentRotationCode_ = rotationCode & 0x3u;
 
@@ -133,23 +134,23 @@ bool MfHwDecoder::DecodeAccessUnit(
 
     HRESULT hr = decoder_->ProcessInput(0, sample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-        PullOutputs(fpsNum, fpsDen);
+        PullOutputs(fpsNum, fpsDen, skipPublish);
         hr = decoder_->ProcessInput(0, sample.Get(), 0);
     }
     if (FAILED(hr)) {
         return false;
     }
 
-    return PullOutputs(fpsNum, fpsDen);
+    return PullOutputs(fpsNum, fpsDen, skipPublish);
 }
 
 void MfHwDecoder::DrainAll(uint32_t fpsNum, uint32_t fpsDen) {
     if (!initialized_ || !decoder_) return;
     decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-    PullOutputs(fpsNum, fpsDen);
+    PullOutputs(fpsNum, fpsDen, false);
 }
 
-bool MfHwDecoder::PullOutputs(uint32_t fpsNum, uint32_t fpsDen) {
+bool MfHwDecoder::PullOutputs(uint32_t fpsNum, uint32_t fpsDen, bool skipPublish) {
     while (true) {
         MFT_OUTPUT_STREAM_INFO info{};
         if (FAILED(decoder_->GetOutputStreamInfo(0, &info))) {
@@ -193,6 +194,10 @@ bool MfHwDecoder::PullOutputs(uint32_t fpsNum, uint32_t fpsDen) {
         }
         if (FAILED(hr) || !outSample) {
             return false;
+        }
+        if (skipPublish) {
+            ++decodedFrames_;
+            continue;
         }
 
         LONGLONG sampleTimeHns = 0;

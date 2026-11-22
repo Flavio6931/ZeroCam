@@ -272,7 +272,10 @@ class ZeroCamService : Service() {
         activeHostLabel = if (activeIsWifi) configuredHost.ifEmpty { "Wi-Fi" } else "Cable USB"
         activePort = configuredPort
 
-        val client = TcpStreamClient(onControlJson = { json -> handleRemoteControlJson(json) })
+        val client = TcpStreamClient(
+            onControlJson = { json -> handleRemoteControlJson(json) },
+            onCongestionRequestKeyFrame = { encoder?.requestKeyFrame() }
+        )
         tcpClient = client
 
         val initialSize = startCaptureComponents(client, reqW, reqH, fps, bitrate, front, noPreview, torch, autoFallback)

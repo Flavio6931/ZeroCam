@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "1.2.5",
+    [string]$Version = "1.3.0",
     [string]$SignThumbprint = "",
     [switch]$NoSign,
     [switch]$SkipAndroid,
@@ -11,11 +11,11 @@ $root = Split-Path -Parent $PSScriptRoot
 $distDir = Join-Path $root "dist"
 $pkgDir = Join-Path $distDir "ZeroCam-Windows-x64"
 
-# Asegura que Ninja recompile en app, vcam_source, shared y tests si algún header cambió recientemente (MSVC /showIncludes en español).
+# Asegura que Ninja recompile si algún header cambió recientemente (MSVC /showIncludes en español).
 $latestHeader = Get-ChildItem (Join-Path $root "windows") -Include *.h,*.hpp -Recurse |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($latestHeader) {
-    foreach ($subDir in @("windows\app", "windows\vcam_source", "windows\shared", "windows\tests")) {
+    foreach ($subDir in @("windows\app", "windows\vcam_source", "windows\dshow_source", "windows\shared", "windows\tests")) {
         $fullSub = Join-Path $root $subDir
         if (Test-Path $fullSub) {
             Get-ChildItem $fullSub -Filter *.cpp | ForEach-Object {
@@ -71,14 +71,17 @@ function Invoke-AuthenticodeSign([string]$FilePath) {
     }
 }
 
-Write-Host "[ZeroCam] 1/5 Compilando Windows Release x64..."
+Write-Host "[ZeroCam] 1/5 Compilando Windows Release (x64 + DirectShow x86)..."
 & (Join-Path $PSScriptRoot "build_windows.ps1") -Config Release
 
 $winBuildDir = Join-Path $root "build\windows-x64-release"
-$exeSrc = Join-Path $winBuildDir "ZeroCam.exe"
-$dllSrc = Join-Path $winBuildDir "ZeroCamSource.dll"
-if (-not (Test-Path $exeSrc) -or -not (Test-Path $dllSrc)) {
-    throw "Faltan ZeroCam.exe o ZeroCamSource.dll en $winBuildDir"
+$win86BuildDir = Join-Path $root "build\windows-x86-release"
+$exeSrc  = Join-Path $winBuildDir "ZeroCam.exe"
+$dllSrc  = Join-Path $winBuildDir "ZeroCamSource.dll"
+$ds64Src = Join-Path $winBuildDir "ZeroCamDShow64.dll"
+$ds32Src = Join-Path $win86BuildDir "ZeroCamDShow32.dll"
+if (-not (Test-Path $exeSrc) -or -not (Test-Path $dllSrc) -or -not (Test-Path $ds64Src) -or -not (Test-Path $ds32Src)) {
+    throw "Faltan binarios compilados (ZeroCam.exe / ZeroCamSource.dll / ZeroCamDShow64.dll / ZeroCamDShow32.dll)."
 }
 
 Write-Host "[ZeroCam] 2/5 Localizando adb.exe portable..."
@@ -95,19 +98,25 @@ if (-not $adbDir) {
     throw "No se encontró adb.exe para empaquetar distribución portable."
 }
 
-Write-Host "[ZeroCam] 3/5 Preparando paquete Windows x64 en $pkgDir..."
+Write-Host "[ZeroCam] 3/5 Preparando paquete Windows en $pkgDir..."
 if (Test-Path $pkgDir) { Remove-Item $pkgDir -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $pkgDir, (Join-Path $pkgDir "adb") | Out-Null
 
-$pkgExe = Join-Path $pkgDir "ZeroCam.exe"
-$pkgDll = Join-Path $pkgDir "ZeroCamSource.dll"
-Copy-Item $exeSrc $pkgExe -Force
-Copy-Item $dllSrc $pkgDll -Force
+$pkgExe  = Join-Path $pkgDir "ZeroCam.exe"
+$pkgDll  = Join-Path $pkgDir "ZeroCamSource.dll"
+$pkgDs64 = Join-Path $pkgDir "ZeroCamDShow64.dll"
+$pkgDs32 = Join-Path $pkgDir "ZeroCamDShow32.dll"
+Copy-Item $exeSrc  $pkgExe  -Force
+Copy-Item $dllSrc  $pkgDll  -Force
+Copy-Item $ds64Src $pkgDs64 -Force
+Copy-Item $ds32Src $pkgDs32 -Force
 
 if ($signtool -and $resolvedThumb) {
     Write-Host "[ZeroCam] Firmando Authenticode SHA-256 (thumbprint $resolvedThumb)..."
     Invoke-AuthenticodeSign $pkgExe
     Invoke-AuthenticodeSign $pkgDll
+    Invoke-AuthenticodeSign $pkgDs64
+    Invoke-AuthenticodeSign $pkgDs32
 }
 
 foreach ($adbFile in @("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")) {
@@ -123,8 +132,8 @@ ZeroCam v$Version — Guía rápida para cualquier usuario
 ======================================================
 
 Requisitos:
-- PC: Windows 11 x64 para Cámara Virtual nativa en OBS, Discord, Zoom o Meet.
-  (En Windows 10 funciona como Receptor + Vista Previa en pantalla).
+- PC: Windows 10 x64 (vía DirectShow 32/64-bit) y Windows 11 x64 (Media Foundation nativa)
+  compatible con Discord, OBS Studio, Zoom, Meet y Cámara de Windows.
 - Móvil: Android 8.0+ con ZeroCam-Android-v$Version.apk instalado.
   (Al migrar desde v1.1.0 desinstala la versión anterior en Android antes de instalar v$Version por el cambio a firma ECDSA P-256).
 
@@ -165,8 +174,6 @@ if (-not $SkipAndroid) {
     try {
         $env:JAVA_HOME = $jdk21.FullName
         Push-Location $androidDir
-        # PowerShell 5.1 convierte avisos de stderr (p. ej. "SDK XML version 4") en errores fatales
-        # bajo $ErrorActionPreference=Stop si la salida está redirigida; se decide por el exit code.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         & $gradleBat.FullName testDebugUnitTest assembleRelease --no-daemon

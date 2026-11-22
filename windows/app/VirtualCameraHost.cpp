@@ -18,6 +18,38 @@ constexpr const wchar_t* kFwRuleTcpName       = L"ZeroCam Wi-Fi Video (TCP 5000-
 constexpr const wchar_t* kFwRuleLegacyTcpName = L"ZeroCam Wi-Fi Video (TCP 5000)";
 constexpr const wchar_t* kFwRuleUdpName       = L"ZeroCam Wi-Fi Discovery (UDP 5001)";
 
+struct MfVirtualCamApi {
+    HMODULE mod = nullptr;
+    using FnIsSupported = HRESULT(STDAPICALLTYPE*)(MFVirtualCameraType, BOOL*);
+    using FnCreate = HRESULT(STDAPICALLTYPE*)(
+        MFVirtualCameraType,
+        MFVirtualCameraLifetime,
+        MFVirtualCameraAccess,
+        LPCWSTR,
+        LPCWSTR,
+        const GUID*,
+        ULONG,
+        IMFVirtualCamera**);
+    FnIsSupported isSupported = nullptr;
+    FnCreate create = nullptr;
+};
+
+// Resuelve dinámicamente mfsensorgroup.dll (solo Windows 11) para conservar compatibilidad binaria con Windows 10.
+const MfVirtualCamApi& GetMfVirtualCamApi() noexcept {
+    static const MfVirtualCamApi api = []() {
+        MfVirtualCamApi res{};
+        res.mod = LoadLibraryExW(L"mfsensorgroup.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (res.mod) {
+            res.isSupported = reinterpret_cast<MfVirtualCamApi::FnIsSupported>(
+                GetProcAddress(res.mod, "MFIsVirtualCameraTypeSupported"));
+            res.create = reinterpret_cast<MfVirtualCamApi::FnCreate>(
+                GetProcAddress(res.mod, "MFCreateVirtualCamera"));
+        }
+        return res;
+    }();
+    return api;
+}
+
 // Inicializa COM en el hilo actual solo si aún no fue inicializado.
 struct ScopedCoInit {
     HRESULT hr = E_FAIL;
@@ -127,6 +159,13 @@ bool IsPathReparsePoint(const std::wstring& path) noexcept {
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 }
 
+bool IsExistingRegularFile(const std::wstring& path) noexcept {
+    const DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+           (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
 // Aplica una DACL protegida (y opcionalmente Mandatory Label SACL) por handle evitando TOCTOU por nombre.
 bool ApplySddlByHandle(HANDLE handle, const wchar_t* sddl, bool includeMandatoryLabel) {
     if (handle == INVALID_HANDLE_VALUE || handle == nullptr) {
@@ -206,56 +245,9 @@ bool ReadBinaryFile(const std::wstring& path, std::vector<char>& outBytes) {
     return sz == 0 || ifs.read(outBytes.data(), sz).good();
 }
 
-} // namespace
-
-VirtualCameraHost::~VirtualCameraHost() {
-    Stop();
-}
-
-bool VirtualCameraHost::IsPlatformSupported() {
-    BOOL supported = FALSE;
-    return SUCCEEDED(MFIsVirtualCameraTypeSupported(MFVirtualCameraType_SoftwareCameraSource, &supported)) && supported == TRUE;
-}
-
-bool VirtualCameraHost::IsComRegistered(std::wstring* outDllPath) {
-    const std::wstring keyPath = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kZeroCamClsidString + L"\\InprocServer32";
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
-        return false;
-    }
-
-    wchar_t pathBuf[MAX_PATH]{};
-    DWORD cbData = sizeof(pathBuf);
-    DWORD type = 0;
-    const LONG rc = RegQueryValueExW(hKey, nullptr, nullptr, &type, reinterpret_cast<BYTE*>(pathBuf), &cbData);
-    RegCloseKey(hKey);
-
-    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
-        return false;
-    }
-    if (outDllPath) {
-        *outDllPath = pathBuf;
-    }
-    return GetFileAttributesW(pathBuf) != INVALID_FILE_ATTRIBUTES;
-}
-
-bool VirtualCameraHost::IsInstalledDllUpToDate() {
-    std::wstring installedPath;
-    if (!IsComRegistered(&installedPath)) {
-        return false;
-    }
-
-    wchar_t exePath[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring localDll(exePath);
-    const size_t slash = localDll.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
-        return true;
-    }
-    localDll = localDll.substr(0, slash + 1) + L"ZeroCamSource.dll";
-
+bool AreFilesIdentical(const std::wstring& localPath, const std::wstring& installedPath) {
     WIN32_FILE_ATTRIBUTE_DATA localInfo{}, instInfo{};
-    if (!GetFileAttributesExW(localDll.c_str(), GetFileExInfoStandard, &localInfo)) {
+    if (!GetFileAttributesExW(localPath.c_str(), GetFileExInfoStandard, &localInfo)) {
         return true;
     }
     if (!GetFileAttributesExW(installedPath.c_str(), GetFileExInfoStandard, &instInfo)) {
@@ -265,15 +257,275 @@ bool VirtualCameraHost::IsInstalledDllUpToDate() {
         localInfo.nFileSizeLow != instInfo.nFileSizeLow) {
         return false;
     }
-
     std::vector<char> localBytes, instBytes;
-    if (!ReadBinaryFile(localDll, localBytes)) {
-        return true;
-    }
-    if (!ReadBinaryFile(installedPath, instBytes)) {
+    if (!ReadBinaryFile(localPath, localBytes)) return true;
+    if (!ReadBinaryFile(installedPath, instBytes)) return false;
+    return localBytes == instBytes;
+}
+
+bool QueryClsidInprocPath(const wchar_t* clsidString, REGSAM wowFlag, std::wstring& outPath) {
+    const std::wstring keyPath = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + clsidString + L"\\InprocServer32";
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ | wowFlag, &hKey) != ERROR_SUCCESS) {
         return false;
     }
-    return localBytes == instBytes;
+    wchar_t pathBuf[MAX_PATH]{};
+    DWORD cbData = sizeof(pathBuf);
+    DWORD type = 0;
+    const LONG rc = RegQueryValueExW(hKey, nullptr, nullptr, &type, reinterpret_cast<BYTE*>(pathBuf), &cbData);
+    RegCloseKey(hKey);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        return false;
+    }
+    outPath = pathBuf;
+    return GetFileAttributesW(pathBuf) != INVALID_FILE_ATTRIBUTES;
+}
+
+bool CopyAndHardenDll(const std::wstring& srcPath, const std::wstring& dstPath) {
+    if (!ValidateExistingFileOrMissing(dstPath)) return false;
+    bool copied = false;
+    for (int tries = 0; tries < 10; ++tries) {
+        if (CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE)) {
+            copied = true;
+            break;
+        }
+        Sleep(150);
+    }
+    if (!copied) return false;
+
+    HANDLE hCheck = CreateFileW(
+        dstPath.c_str(),
+        READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+        nullptr);
+    const bool valid = (hCheck != INVALID_HANDLE_VALUE) &&
+                       ValidateOpenedIpcFileHandle(hCheck) &&
+                       ApplySddlByHandle(
+                           hCheck,
+                           L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;LS)(A;;FRFX;;;IU)",
+                           false);
+    if (hCheck != INVALID_HANDLE_VALUE) CloseHandle(hCheck);
+    return valid;
+}
+
+HRESULT CallDllRegEntry(const std::wstring& dllPath, const char* entryName) {
+    HRESULT hr = E_FAIL;
+    if (HMODULE mod = LoadLibraryW(dllPath.c_str())) {
+        using RegFn = HRESULT(STDAPICALLTYPE*)();
+        if (auto pFn = reinterpret_cast<RegFn>(GetProcAddress(mod, entryName))) {
+            hr = pFn();
+        }
+        FreeLibrary(mod);
+    }
+    return hr;
+}
+
+bool RunWow64Regsvr32(const std::wstring& dllPath, bool unregister) {
+    wchar_t sysDir[MAX_PATH]{};
+    const UINT n = GetSystemWow64DirectoryW(sysDir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    const std::wstring regsvr = std::wstring(sysDir, n) + L"\\regsvr32.exe";
+    if (!IsExistingRegularFile(regsvr)) return false;
+
+    std::wstring cmd = L"\"" + regsvr + L"\" /s " + (unregister ? L"/u " : L"") + L"\"" + dllPath + L"\"";
+    std::vector<wchar_t> cmdBuf(cmd.begin(), cmd.end());
+    cmdBuf.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(regsvr.c_str(), cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    const DWORD waitRc = WaitForSingleObject(pi.hProcess, 10000);
+    DWORD exitCode = 1;
+    if (waitRc == WAIT_OBJECT_0) {
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+    } else {
+        TerminateProcess(pi.hProcess, 1);
+    }
+    CloseHandle(pi.hProcess);
+    return waitRc == WAIT_OBJECT_0 && exitCode == 0;
+}
+
+HRESULT CreateMfCamWithCategories(
+    const MfVirtualCamApi& api,
+    MFVirtualCameraLifetime lifetime,
+    MFVirtualCameraAccess access,
+    IMFVirtualCamera** ppCam) {
+    if (!api.create || !ppCam) return E_POINTER;
+    const GUID cats[2] = { kKsCategoryVideoCamera, kKsCategoryCapture };
+    HRESULT hr = api.create(
+        MFVirtualCameraType_SoftwareCameraSource,
+        lifetime,
+        access,
+        kZeroCamFriendlyName,
+        kZeroCamClsidString,
+        cats,
+        2,
+        ppCam);
+    if (FAILED(hr)) {
+        hr = api.create(
+            MFVirtualCameraType_SoftwareCameraSource,
+            lifetime,
+            access,
+            kZeroCamFriendlyName,
+            kZeroCamClsidString,
+            cats,
+            1,
+            ppCam);
+    }
+    if (FAILED(hr)) {
+        hr = api.create(
+            MFVirtualCameraType_SoftwareCameraSource,
+            lifetime,
+            access,
+            kZeroCamFriendlyName,
+            kZeroCamClsidString,
+            nullptr,
+            0,
+            ppCam);
+    }
+    return hr;
+}
+
+void UnregisterDShowBestEffort() {
+    std::wstring dll64;
+    if (QueryClsidInprocPath(kZeroCamDShowClsidString, 0, dll64) && IsExistingRegularFile(dll64)) {
+        (void)CallDllRegEntry(dll64, "DllUnregisterServer");
+    } else if (IsExistingRegularFile(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll")) {
+        (void)CallDllRegEntry(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll", "DllUnregisterServer");
+    }
+
+    std::wstring dll32;
+    if (QueryClsidInprocPath(kZeroCamDShowClsidString, KEY_WOW64_32KEY, dll32) && IsExistingRegularFile(dll32)) {
+        (void)RunWow64Regsvr32(dll32, true);
+    } else if (IsExistingRegularFile(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll")) {
+        (void)RunWow64Regsvr32(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll", true);
+    }
+
+    const std::wstring clsidDShow = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kZeroCamDShowClsidString;
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, clsidDShow.c_str());
+    RegDeleteKeyExW(HKEY_LOCAL_MACHINE, clsidDShow.c_str(), KEY_WOW64_32KEY, 0);
+}
+
+std::wstring GetExecutableDirectory() {
+    wchar_t exePath[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return {};
+    std::wstring dir(exePath, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return {};
+    dir.resize(slash + 1);
+    return dir;
+}
+
+} // namespace
+
+VirtualCameraHost::~VirtualCameraHost() {
+    Stop();
+}
+
+bool VirtualCameraHost::IsMfVirtualCameraSupported() {
+    const MfVirtualCamApi& api = GetMfVirtualCamApi();
+    if (!api.isSupported || !api.create) {
+        return false;
+    }
+    BOOL supported = FALSE;
+    return SUCCEEDED(api.isSupported(MFVirtualCameraType_SoftwareCameraSource, &supported)) && supported == TRUE;
+}
+
+bool VirtualCameraHost::IsPlatformSupported() {
+    // Soporta Windows 11 (MFCreateVirtualCamera) y Windows 10 (DirectShow).
+    return true;
+}
+
+bool VirtualCameraHost::IsDShowRegistered(std::wstring* outDll64Path) {
+    std::wstring path64;
+    if (!QueryClsidInprocPath(kZeroCamDShowClsidString, 0, path64)) {
+        return false;
+    }
+    if (outDll64Path) *outDll64Path = path64;
+    return true;
+}
+
+bool VirtualCameraHost::IsSystemMfCameraPresent() {
+    if (!IsMfVirtualCameraSupported()) return false;
+    ScopedCoInit co;
+    if (FAILED(co.hr) && co.hr != RPC_E_CHANGED_MODE) return false;
+
+    Microsoft::WRL::ComPtr<IMFAttributes> attrs;
+    if (FAILED(MFCreateAttributes(&attrs, 1)) ||
+        FAILED(attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))) {
+        return false;
+    }
+
+    IMFActivate** devices = nullptr;
+    UINT32 count = 0;
+    if (FAILED(MFEnumDeviceSources(attrs.Get(), &devices, &count)) || !devices) {
+        return false;
+    }
+
+    bool found = false;
+    for (UINT32 i = 0; i < count; ++i) {
+        if (devices[i]) {
+            wchar_t nameBuf[256]{};
+            UINT32 len = 0;
+            if (!found && SUCCEEDED(devices[i]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, nameBuf, 256, &len))) {
+                if (_wcsicmp(nameBuf, kZeroCamFriendlyName) == 0) {
+                    found = true;
+                }
+            }
+            devices[i]->Release();
+        }
+    }
+    CoTaskMemFree(devices);
+    return found;
+}
+
+bool VirtualCameraHost::IsComRegistered(std::wstring* outDllPath) {
+    if (IsMfVirtualCameraSupported()) {
+        std::wstring path;
+        if (!QueryClsidInprocPath(kZeroCamClsidString, 0, path)) {
+            return false;
+        }
+        if (outDllPath) *outDllPath = path;
+        return true;
+    }
+    return IsDShowRegistered(outDllPath);
+}
+
+bool VirtualCameraHost::IsInstalledDllUpToDate() {
+    const std::wstring localDir = GetExecutableDirectory();
+    if (localDir.empty()) return true;
+
+    if (IsMfVirtualCameraSupported()) {
+        std::wstring installedPath;
+        if (!IsComRegistered(&installedPath)) return false;
+        return AreFilesIdentical(localDir + L"ZeroCamSource.dll", installedPath);
+    }
+
+    std::wstring installed64;
+    if (!IsDShowRegistered(&installed64)) return false;
+    if (!AreFilesIdentical(localDir + L"ZeroCamDShow64.dll", installed64)) return false;
+
+    const std::wstring local32 = localDir + L"ZeroCamDShow32.dll";
+    if (IsExistingRegularFile(local32)) {
+        std::wstring installed32;
+        if (!QueryClsidInprocPath(kZeroCamDShowClsidString, KEY_WOW64_32KEY, installed32)) {
+            return false;
+        }
+        if (!AreFilesIdentical(local32, installed32)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
@@ -285,19 +537,29 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     const std::wstring localExe(exePath);
-    std::wstring localDll(localExe);
-    const size_t slash = localDll.find_last_of(L"\\/");
-    if (slash == std::wstring::npos) {
+    const std::wstring localDir = GetExecutableDirectory();
+    if (localDir.empty()) {
         return fail(L"No se pudo resolver la carpeta del ejecutable.");
     }
-    localDll = localDll.substr(0, slash + 1) + L"ZeroCamSource.dll";
-    if (GetFileAttributesW(localDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        return fail(L"No se encontró ZeroCamSource.dll junto a ZeroCam.exe.");
+
+    const bool useMfWin11 = IsMfVirtualCameraSupported();
+    const std::wstring localMfDll = localDir + L"ZeroCamSource.dll";
+    const std::wstring localDs64 = localDir + L"ZeroCamDShow64.dll";
+    const std::wstring localDs32 = localDir + L"ZeroCamDShow32.dll";
+
+    if (useMfWin11) {
+        if (!IsExistingRegularFile(localMfDll)) {
+            return fail(L"No se encontró ZeroCamSource.dll junto a ZeroCam.exe.");
+        }
+    } else {
+        if (!IsExistingRegularFile(localDs64)) {
+            return fail(L"No se encontró ZeroCamDShow64.dll junto a ZeroCam.exe para Windows 10.");
+        }
     }
 
-    // Detiene FrameServer si estaba activo para poder reemplazar ZeroCamSource.dll sin bloqueo.
+    // Detiene FrameServer temporalmente si está activo en Win11 para reemplazar DLLs sin bloqueo.
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    SC_HANDLE svc = scm ? OpenServiceW(scm, L"FrameServer", SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START) : nullptr;
+    SC_HANDLE svc = (useMfWin11 && scm) ? OpenServiceW(scm, L"FrameServer", SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START) : nullptr;
     bool wasRunning = false;
     if (svc) {
         SERVICE_STATUS_PROCESS ssp{};
@@ -319,9 +581,6 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
     }
 
     const std::wstring dirPath = L"C:\\ProgramData\\ZeroCam";
-    const std::wstring installedDll = dirPath + L"\\ZeroCamSource.dll";
-
-    // Endurece la carpeta ANTES de copiar la DLL o crear ipc_ring.bin (corta herencia Users:(WD,AD) de ProgramData).
     if (!EnsureProtectedProgramDataDir(dirPath)) {
         if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
         if (svc) CloseServiceHandle(svc);
@@ -329,82 +588,37 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
         return fail(L"No se pudo proteger C:\\ProgramData\\ZeroCam (posible reparse point o permiso insuficiente).");
     }
 
-    // Valida ausencia de reparse points y hardlinks (nNumberOfLinks == 1) ANTES de copiar/sobrescribir la DLL o abrir IPC.
-    if (!ValidateExistingFileOrMissing(installedDll) || !ValidateExistingFileOrMissing(kZeroCamDefaultIpcPath)) {
-        if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
-        if (svc) CloseServiceHandle(svc);
-        if (scm) CloseServiceHandle(scm);
-        return fail(L"Se detectó un enlace simbólico o hardlink no permitido en ProgramData\\ZeroCam.");
-    }
-
-    bool copied = false;
-    for (int tries = 0; tries < 10; ++tries) {
-        if (CopyFileW(localDll.c_str(), installedDll.c_str(), FALSE)) {
-            copied = true;
-            break;
-        }
-        Sleep(150);
-    }
-    if (!copied) {
-        if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
-        if (svc) CloseServiceHandle(svc);
-        if (scm) CloseServiceHandle(scm);
-        return fail(L"No se pudo copiar ZeroCamSource.dll a ProgramData.");
-    }
-
-    // Valida la DLL instalada por handle (sin reparse points ni hardlinks) y fija DACL protegida.
-    HANDLE hDllCheck = CreateFileW(
-        installedDll.c_str(),
-        READ_CONTROL | WRITE_DAC,
-        FILE_SHARE_READ,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-        nullptr);
-    const bool dllValid = (hDllCheck != INVALID_HANDLE_VALUE) &&
-                          ValidateOpenedIpcFileHandle(hDllCheck) &&
-                          ApplySddlByHandle(
-                              hDllCheck,
-                              L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;LS)(A;;FRFX;;;IU)",
-                              false);
-    if (hDllCheck != INVALID_HANDLE_VALUE) CloseHandle(hDllCheck);
-    if (!dllValid) {
-        if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
-        if (svc) CloseServiceHandle(svc);
-        if (scm) CloseServiceHandle(scm);
-        return fail(L"No se pudo verificar o proteger ZeroCamSource.dll en ProgramData.");
-    }
-
-    // Pre-crea ipc_ring.bin por handle con tamaño exacto, valida hardlinks/reparse y aplica DACL + Mandatory Label Medium.
-    HANDLE hIpc = CreateFileW(
-        kZeroCamDefaultIpcPath,
-        GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr,
-        OPEN_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
-        nullptr);
+    // Pre-crea/valida ipc_ring.bin por handle con tamaño exacto y DACL endurecida (SY/BA/LS/IU, sin AC/BU).
     bool ipcOk = false;
-    if (hIpc != INVALID_HANDLE_VALUE) {
-        if (ValidateOpenedIpcFileHandle(hIpc)) {
-            LARGE_INTEGER curSz{};
-            const LONGLONG reqSz = static_cast<LONGLONG>(sizeof(ZeroCamSharedMemory));
-            bool sizeOk = GetFileSizeEx(hIpc, &curSz) == TRUE;
-            if (sizeOk && curSz.QuadPart != reqSz) {
-                LARGE_INTEGER targetSz{};
-                targetSz.QuadPart = reqSz;
-                sizeOk = (SetFilePointerEx(hIpc, targetSz, nullptr, FILE_BEGIN) == TRUE &&
-                          SetEndOfFile(hIpc) == TRUE);
+    if (ValidateExistingFileOrMissing(kZeroCamDefaultIpcPath)) {
+        HANDLE hIpc = CreateFileW(
+            kZeroCamDefaultIpcPath,
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr);
+        if (hIpc != INVALID_HANDLE_VALUE) {
+            if (ValidateOpenedIpcFileHandle(hIpc)) {
+                LARGE_INTEGER curSz{};
+                const LONGLONG reqSz = static_cast<LONGLONG>(sizeof(ZeroCamSharedMemory));
+                bool sizeOk = GetFileSizeEx(hIpc, &curSz) == TRUE;
+                if (sizeOk && curSz.QuadPart != reqSz) {
+                    LARGE_INTEGER targetSz{};
+                    targetSz.QuadPart = reqSz;
+                    sizeOk = (SetFilePointerEx(hIpc, targetSz, nullptr, FILE_BEGIN) == TRUE &&
+                              SetEndOfFile(hIpc) == TRUE);
+                }
+                if (sizeOk) {
+                    ipcOk = ApplySddlByHandle(
+                        hIpc,
+                        L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;LS)(A;;FRFW;;;IU)S:(ML;;NWNR;;;ME)",
+                        true);
+                }
             }
-            if (sizeOk) {
-                // Sin AC ni BU: solo SYSTEM, Admins, LOCAL SERVICE (FrameServer) e Interactive User (ZeroCam.exe) a nivel Medium.
-                ipcOk = ApplySddlByHandle(
-                    hIpc,
-                    L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;LS)(A;;FRFW;;;IU)S:(ML;;NWNR;;;ME)",
-                    true);
-            }
+            CloseHandle(hIpc);
         }
-        CloseHandle(hIpc);
     }
     if (!ipcOk) {
         if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
@@ -413,29 +627,77 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
         return fail(L"No se pudo crear o endurecer los permisos de ipc_ring.bin.");
     }
 
-    HRESULT regHr = E_FAIL;
-    if (HMODULE mod = LoadLibraryW(installedDll.c_str())) {
-        using DllRegisterFn = HRESULT(STDAPICALLTYPE*)();
-        if (auto pReg = reinterpret_cast<DllRegisterFn>(GetProcAddress(mod, "DllRegisterServer"))) {
-            regHr = pReg();
+    if (useMfWin11) {
+        const std::wstring installedMf = dirPath + L"\\ZeroCamSource.dll";
+        if (!CopyAndHardenDll(localMfDll, installedMf)) {
+            if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
+            if (svc) CloseServiceHandle(svc);
+            if (scm) CloseServiceHandle(scm);
+            return fail(L"No se pudo copiar o proteger ZeroCamSource.dll en ProgramData.");
         }
-        FreeLibrary(mod);
+
+        // Evita cámaras duplicadas en Windows 11 limpiando restos previos de DirectShow si existieran.
+        UnregisterDShowBestEffort();
+        if (!IsPathReparsePoint(dirPath)) {
+            DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll");
+            DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll");
+        }
+
+        const HRESULT regHr = CallDllRegEntry(installedMf, "DllRegisterServer");
+        if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
+        if (svc) CloseServiceHandle(svc);
+        if (scm) CloseServiceHandle(scm);
+
+        if (FAILED(regHr)) {
+            return fail(L"DllRegisterServer falló (HRESULT " + FormatHrHex(regHr) + L").");
+        }
+        if (!IsComRegistered() || !IsInstalledDllUpToDate()) {
+            return fail(L"El registro COM no pudo verificarse en HKLM.");
+        }
+
+        // Registra cámara persistente de sistema (AllUsers) para que Discord la detecte sin conflictos UAC.
+        ScopedCoInit co;
+        const MfVirtualCamApi& api = GetMfVirtualCamApi();
+        if (api.create && (SUCCEEDED(co.hr) || co.hr == RPC_E_CHANGED_MODE)) {
+            Microsoft::WRL::ComPtr<IMFVirtualCamera> oldCam;
+            if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &oldCam)) && oldCam) {
+                oldCam->Stop();
+                oldCam->Remove();
+                oldCam->Shutdown();
+                oldCam.Reset();
+                Sleep(100);
+            }
+            Microsoft::WRL::ComPtr<IMFVirtualCamera> sysCam;
+            if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &sysCam)) && sysCam) {
+                (void)sysCam->Start(nullptr);
+                (void)sysCam->Shutdown();
+            }
+        }
+    } else {
+        if (svc) CloseServiceHandle(svc);
+        if (scm) CloseServiceHandle(scm);
+
+        const std::wstring installed64 = dirPath + L"\\ZeroCamDShow64.dll";
+        if (!CopyAndHardenDll(localDs64, installed64)) {
+            return fail(L"No se pudo copiar o proteger ZeroCamDShow64.dll en ProgramData.");
+        }
+        const HRESULT hr64 = CallDllRegEntry(installed64, "DllRegisterServer");
+        if (FAILED(hr64)) {
+            return fail(L"DllRegisterServer DirectShow 64-bit falló (HRESULT " + FormatHrHex(hr64) + L").");
+        }
+
+        if (IsExistingRegularFile(localDs32)) {
+            const std::wstring installed32 = dirPath + L"\\ZeroCamDShow32.dll";
+            if (!CopyAndHardenDll(localDs32, installed32) || !RunWow64Regsvr32(installed32, false)) {
+                return fail(L"No se pudo registrar ZeroCamDShow32.dll (compatibilidad apps 32-bit).");
+            }
+        }
+
+        if (!IsDShowRegistered() || !IsInstalledDllUpToDate()) {
+            return fail(L"No se pudo verificar el registro DirectShow en HKLM.");
+        }
     }
 
-    if (wasRunning && svc) {
-        StartServiceW(svc, 0, nullptr);
-    }
-    if (svc) CloseServiceHandle(svc);
-    if (scm) CloseServiceHandle(scm);
-
-    if (FAILED(regHr)) {
-        return fail(L"DllRegisterServer falló (HRESULT " + FormatHrHex(regHr) + L").");
-    }
-    if (!IsComRegistered() || !IsInstalledDllUpToDate()) {
-        return fail(L"El registro COM no pudo verificarse en HKLM.");
-    }
-
-    // Reglas automáticas de Windows Defender Firewall para ZeroCam Wi-Fi (rango de respaldo 5000-5010).
     UpsertFirewallRule(
         kFwRuleTcpName,
         L"Permite recibir video ZeroCam desde Android por Wi-Fi (TCP)",
@@ -454,9 +716,25 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
 }
 
 bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
-    // Detiene FrameServer para liberar el bloqueo sobre C:\ProgramData\ZeroCam\ZeroCamSource.dll.
+    const bool useMfWin11 = IsMfVirtualCameraSupported();
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    SC_HANDLE svc = scm ? OpenServiceW(scm, L"FrameServer", SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START) : nullptr;
+    SC_HANDLE svc = (useMfWin11 && scm) ? OpenServiceW(scm, L"FrameServer", SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_START) : nullptr;
+
+    if (useMfWin11) {
+        ScopedCoInit co;
+        const MfVirtualCamApi& api = GetMfVirtualCamApi();
+        if (api.create && (SUCCEEDED(co.hr) || co.hr == RPC_E_CHANGED_MODE)) {
+            Microsoft::WRL::ComPtr<IMFVirtualCamera> sysCam;
+            if (SUCCEEDED(CreateMfCamWithCategories(api, MFVirtualCameraLifetime_System, MFVirtualCameraAccess_AllUsers, &sysCam)) && sysCam) {
+                sysCam->Stop();
+                sysCam->Remove();
+                sysCam->Shutdown();
+            }
+        }
+    }
+
+    UnregisterDShowBestEffort();
+
     bool wasRunning = false;
     if (svc) {
         SERVICE_STATUS_PROCESS ssp{};
@@ -477,9 +755,8 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
         }
     }
 
-    // Elimina directamente la clave CLSID en HKLM sin cargar DLLs externas en un proceso elevado.
-    const std::wstring clsidPath = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kZeroCamClsidString;
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, clsidPath.c_str());
+    const std::wstring clsidMf = std::wstring(L"SOFTWARE\\Classes\\CLSID\\") + kZeroCamClsidString;
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, clsidMf.c_str());
 
     RemoveFirewallRules();
 
@@ -487,6 +764,12 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
         for (int tries = 0; tries < 10; ++tries) {
             if (!IsPathReparsePoint(L"C:\\ProgramData\\ZeroCam\\ZeroCamSource.dll")) {
                 DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamSource.dll");
+            }
+            if (!IsPathReparsePoint(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll")) {
+                DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow64.dll");
+            }
+            if (!IsPathReparsePoint(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll")) {
+                DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamDShow32.dll");
             }
             if (!IsPathReparsePoint(kZeroCamDefaultIpcPath)) {
                 DeleteFileW(kZeroCamDefaultIpcPath);
@@ -498,13 +781,11 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
         }
     }
 
-    if (wasRunning && svc) {
-        StartServiceW(svc, 0, nullptr);
-    }
+    if (wasRunning && svc) StartServiceW(svc, 0, nullptr);
     if (svc) CloseServiceHandle(svc);
     if (scm) CloseServiceHandle(scm);
 
-    if (IsComRegistered()) {
+    if (IsComRegistered() || IsDShowRegistered()) {
         if (outError) *outError = L"No se pudo eliminar el registro COM de ZeroCam en HKLM.";
         return false;
     }
@@ -515,42 +796,55 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
 bool VirtualCameraHost::Start(std::wstring& outError) {
     Stop();
 
-    if (!IsPlatformSupported()) {
-        outError = L"La cámara virtual nativa requiere Windows 11 (compilación 22000 o superior).";
-        return false;
-    }
-    if (!IsComRegistered()) {
-        outError = L"Falta configurar la cámara virtual (acepta el permiso de administrador).";
-        return false;
+    if (IsMfVirtualCameraSupported()) {
+        if (IsSystemMfCameraPresent()) {
+            systemCameraActive_ = true;
+            outError.clear();
+            return true;
+        }
+
+        std::wstring ignored;
+        if (!QueryClsidInprocPath(kZeroCamClsidString, 0, ignored)) {
+            outError = L"Falta configurar la cámara virtual (acepta el permiso de administrador).";
+            return false;
+        }
+
+        const MfVirtualCamApi& api = GetMfVirtualCamApi();
+        HRESULT hr = CreateMfCamWithCategories(
+            api,
+            MFVirtualCameraLifetime_Session,
+            MFVirtualCameraAccess_CurrentUser,
+            &virtualCamera_);
+        if (FAILED(hr) || !virtualCamera_) {
+            outError = L"MFCreateVirtualCamera falló (HRESULT " + FormatHrHex(hr) + L").";
+            return false;
+        }
+
+        hr = virtualCamera_->Start(nullptr);
+        if (FAILED(hr)) {
+            virtualCamera_->Shutdown();
+            virtualCamera_.Reset();
+            outError = L"IMFVirtualCamera::Start falló (HRESULT " + FormatHrHex(hr) + L").";
+            return false;
+        }
+
+        outError.clear();
+        return true;
     }
 
-    HRESULT hr = MFCreateVirtualCamera(
-        MFVirtualCameraType_SoftwareCameraSource,
-        MFVirtualCameraLifetime_Session,
-        MFVirtualCameraAccess_CurrentUser,
-        kZeroCamFriendlyName,
-        kZeroCamClsidString,
-        nullptr,
-        0,
-        &virtualCamera_);
-    if (FAILED(hr)) {
-        outError = L"MFCreateVirtualCamera falló (HRESULT " + FormatHrHex(hr) + L").";
+    // Windows 10: opera mediante filtro DirectShow registrado en ProgramData.
+    if (!IsDShowRegistered()) {
+        outError = L"Falta registrar la cámara DirectShow para Windows 10 (acepta el permiso de administrador).";
         return false;
     }
-
-    hr = virtualCamera_->Start(nullptr);
-    if (FAILED(hr)) {
-        virtualCamera_->Shutdown();
-        virtualCamera_.Reset();
-        outError = L"IMFVirtualCamera::Start falló (HRESULT " + FormatHrHex(hr) + L").";
-        return false;
-    }
-
+    dshowActive_ = true;
     outError.clear();
     return true;
 }
 
 void VirtualCameraHost::Stop() {
+    systemCameraActive_ = false;
+    dshowActive_ = false;
     if (virtualCamera_) {
         virtualCamera_->Stop();
         virtualCamera_->Remove();

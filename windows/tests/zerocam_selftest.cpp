@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "../shared/WireCrypto.h"
@@ -29,6 +30,7 @@
 #include "../app/StreamIngest.h"
 #include "../app/VideoEffects.h"
 #include "../app/VirtualCameraHost.h"
+#include "dshow_selftest_helper.h"
 
 namespace {
 
@@ -1580,6 +1582,38 @@ int wmain(int argc, wchar_t** argv) {
             if (wsa9kOk) {
                 WSACleanup();
             }
+        }
+
+        // 9l. Pruebas Windows 10 DirectShow (ZeroCamDShowTest.dll) + skipPublish + SetProducerActive standby.
+        {
+            const uint64_t seqBeforeSkip = d3dCtx.Ipc() ? d3dCtx.Ipc()->frameSequence.load(std::memory_order_acquire) : 0ull;
+            const uint64_t decBeforeSkip = decoder.DecodedFrames();
+            const uint8_t* singleAu = bytes.data();
+            size_t singleLen = std::min<size_t>(bytes.size(), 4096u);
+            bool skipDecodedOk = false;
+            zerocam::AnnexBParser pSkip;
+            bool fedOne = false;
+            pSkip.Feed(bytes.data(), bytes.size(), 100000, [&](const uint8_t* au, size_t len, int64_t p, bool) {
+                if (!fedOne) {
+                    fedOne = true;
+                    singleAu = au;
+                    singleLen = len;
+                    skipDecodedOk = decoder.DecodeAccessUnit(singleAu, singleLen, p, 30, 1, 0, true);
+                }
+            });
+            const uint64_t seqAfterSkip = d3dCtx.Ipc() ? d3dCtx.Ipc()->frameSequence.load(std::memory_order_acquire) : 0ull;
+            allOk &= Expect(skipDecodedOk && decoder.DecodedFrames() >= decBeforeSkip && seqAfterSkip == seqBeforeSkip,
+                            "MfHwDecoder skipPublish=true decodifica referencia H.264 sin publicar ni usar GPU de render");
+
+            wchar_t dsExePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, dsExePath, MAX_PATH);
+            bool dsMetaOk = false;
+            bool dsYuy2Ok = false;
+            bool dsNv12StandbyOk = false;
+            zerocam::RunDShowSelfTests(dsExePath, d3dCtx, dsMetaOk, dsYuy2Ok, dsNv12StandbyOk);
+            allOk &= Expect(dsMetaOk, "ZeroCamDShowTest expone PIN_CATEGORY_CAPTURE + IAMStreamConfig (NV12 y YUY2)");
+            allOk &= Expect(dsYuy2Ok, "ZeroCamDShowTest entrega frames YUY2 desde ipc_ring.bin y limpia fallback al parar");
+            allOk &= Expect(dsNv12StandbyOk, "ZeroCamDShowTest entrega NV12 vivo y vuelve a negro BT.709 con SetProducerActive(false)");
         }
     }
 

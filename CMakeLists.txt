@@ -5,7 +5,9 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Usar CRT estático (/MT) en todos los binarios para evitar dependencias externas en FrameServer.exe.
+option(ZEROCAM_DSHOW_ONLY "Compila únicamente la DLL del filtro DirectShow (x86 / Win10)" OFF)
+
+# Usar CRT estático (/MT) en todos los binarios para evitar dependencias externas en FrameServer.exe / DirectShow.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_compile_definitions(
@@ -20,8 +22,40 @@ add_compile_definitions(
 if (MSVC)
     add_compile_definitions(_HAS_STATIC_RTTI=0)
     add_compile_options(/W3 /EHsc /permissive- /utf-8 /guard:cf /GS /sdl /GR-)
-    add_link_options(/GUARD:CF /CETCOMPAT /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /DEPENDENTLOADFLAG:0x800)
+    add_link_options(/GUARD:CF /CETCOMPAT /DYNAMICBASE /NXCOMPAT /DEPENDENTLOADFLAG:0x800)
+    if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_link_options(/HIGHENTROPYVA)
+    endif()
 endif()
+
+set(ZEROCAM_DSHOW_SOURCES
+    windows/dshow_source/DllMain.cpp
+    windows/dshow_source/ZeroCamDShowFilter.cpp
+    windows/dshow_source/ZeroCamDShow.def
+)
+
+# Filtro DirectShow clean-room para Windows 10 (64-bit o 32-bit según toolchain)
+add_library(ZeroCamDShow SHARED
+    ${ZEROCAM_DSHOW_SOURCES}
+)
+if (CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set_target_properties(ZeroCamDShow PROPERTIES OUTPUT_NAME "ZeroCamDShow64")
+else()
+    set_target_properties(ZeroCamDShow PROPERTIES OUTPUT_NAME "ZeroCamDShow32")
+endif()
+target_include_directories(ZeroCamDShow PRIVATE
+    windows/shared
+    windows/dshow_source
+)
+target_link_libraries(ZeroCamDShow PRIVATE
+    strmiids
+    ole32
+    oleaut32
+    advapi32
+    uuid
+)
+
+if (NOT ZEROCAM_DSHOW_ONLY)
 
 set(ZEROCAM_VCAM_SOURCES
     windows/vcam_source/DllMain.cpp
@@ -31,7 +65,7 @@ set(ZEROCAM_VCAM_SOURCES
     windows/vcam_source/ZeroCamSource.def
 )
 
-# Target 1: Servidor COM In-Proc de Cámara Virtual (ZeroCamSource.dll — producción sin ZEROCAM_IPC_PATH)
+# Target 1: Servidor COM In-Proc de Cámara Virtual Windows 11 (ZeroCamSource.dll)
 add_library(ZeroCamSource SHARED
     ${ZEROCAM_VCAM_SOURCES}
 )
@@ -52,7 +86,7 @@ target_link_libraries(ZeroCamSource PRIVATE
     advapi32
 )
 
-# Target 1b: Variante exclusiva de pruebas automatizadas con ZEROCAM_ALLOW_IPC_ENV_OVERRIDE=1
+# Target 1b: Variantes exclusivas de pruebas automatizadas con ZEROCAM_ALLOW_IPC_ENV_OVERRIDE=1
 add_library(ZeroCamSourceTest SHARED
     ${ZEROCAM_VCAM_SOURCES}
 )
@@ -77,6 +111,25 @@ target_link_libraries(ZeroCamSourceTest PRIVATE
     advapi32
 )
 
+add_library(ZeroCamDShowTest SHARED
+    ${ZEROCAM_DSHOW_SOURCES}
+)
+set_target_properties(ZeroCamDShowTest PROPERTIES OUTPUT_NAME "ZeroCamDShowTest")
+target_compile_definitions(ZeroCamDShowTest PRIVATE
+    ZEROCAM_ALLOW_IPC_ENV_OVERRIDE=1
+)
+target_include_directories(ZeroCamDShowTest PRIVATE
+    windows/shared
+    windows/dshow_source
+)
+target_link_libraries(ZeroCamDShowTest PRIVATE
+    strmiids
+    ole32
+    oleaut32
+    advapi32
+    uuid
+)
+
 # Fuentes compartidas del motor de decodificación, red, criptografía Wire v2, GPU y cámara virtual
 set(ZEROCAM_ENGINE_SOURCES
     windows/shared/WireCrypto.cpp
@@ -92,7 +145,7 @@ set(ZEROCAM_ENGINE_SOURCES
     windows/app/VirtualCameraHost.cpp
 )
 
-# Target 2: Aplicación Windows nativa Win32 Dark Mode + Tray (ZeroCam.exe)
+# Target 2: Aplicación Windows nativa Win32 Dark Mode + Tray (ZeroCam.exe — carga dinámica mfsensorgroup.dll)
 add_executable(ZeroCam WIN32
     ${ZEROCAM_ENGINE_SOURCES}
     windows/app/AppConfig.cpp
@@ -113,7 +166,6 @@ target_link_libraries(ZeroCam PRIVATE
     mfplat
     mf
     mfuuid
-    mfsensorgroup
     d3d11
     d3dcompiler
     dxgi
@@ -138,6 +190,7 @@ target_link_libraries(ZeroCam PRIVATE
 add_executable(zerocam_selftest
     ${ZEROCAM_ENGINE_SOURCES}
     windows/app/AppConfig.cpp
+    windows/tests/dshow_selftest_helper.cpp
     windows/tests/zerocam_selftest.cpp
 )
 
@@ -155,7 +208,7 @@ target_link_libraries(zerocam_selftest PRIVATE
     mfplat
     mf
     mfuuid
-    mfsensorgroup
+    strmiids
     d3d11
     d3dcompiler
     dxgi
@@ -174,3 +227,5 @@ target_link_libraries(zerocam_selftest PRIVATE
     uxtheme
     advapi32
 )
+
+endif()

@@ -179,6 +179,14 @@ HRESULT ZeroCamMediaStream::Initialize() {
         ipc_.Data()->consumerCount.fetch_add(1, std::memory_order_acq_rel);
         consumerRegistered_ = true;
     }
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    paceTimer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!paceTimer_) {
+        paceTimer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    }
     return S_OK;
 }
 
@@ -541,6 +549,10 @@ HRESULT ZeroCamMediaStream::Shutdown() {
     if (eventQueue_) {
         eventQueue_->Shutdown();
         eventQueue_.Reset();
+    }
+    if (paceTimer_) {
+        CloseHandle(paceTimer_);
+        paceTimer_ = nullptr;
     }
     streamDescriptor_.Reset();
     streamAttributes_.Reset();
@@ -1078,7 +1090,8 @@ HRESULT ZeroCamMediaStream::CreateCpuOrStandbySample(ZeroCamSharedMemory* ipc, I
     return S_OK;
 }
 
-void ZeroCamMediaStream::PaceNextFrame(UINT32 fpsNum, UINT32 fpsDen, uint64_t currentSeq) {
+void ZeroCamMediaStream::PaceNextFrame(ZeroCamSharedMemory* ipc, UINT32 fpsNum, UINT32 fpsDen) {
+    const uint64_t currentSeq = ipc ? ipc->frameSequence.load(std::memory_order_acquire) : 0ull;
     if (currentSeq != 0 && currentSeq != lastSeqDelivered_) {
         lastSeqDelivered_ = currentSeq;
         lastDeliverTickMs_ = GetTickCount64();
@@ -1086,11 +1099,27 @@ void ZeroCamMediaStream::PaceNextFrame(UINT32 fpsNum, UINT32 fpsDen, uint64_t cu
     }
     const ULONGLONG rawFrameMs = (1000ull * static_cast<ULONGLONG>(std::max<UINT32>(1u, fpsDen))) /
                                  static_cast<ULONGLONG>(std::max<UINT32>(1u, fpsNum));
-    const ULONGLONG frameMs = std::clamp<ULONGLONG>(rawFrameMs, 1ull, 200ull);
-    const ULONGLONG now = GetTickCount64();
-    if (lastDeliverTickMs_ != 0 && now < lastDeliverTickMs_ + frameMs) {
-        const ULONGLONG waitMs = std::min<ULONGLONG>((lastDeliverTickMs_ + frameMs) - now, 200ull);
-        Sleep(static_cast<DWORD>(waitMs));
+    const ULONGLONG frameMs = std::clamp<ULONGLONG>(rawFrameMs, 4ull, 100ull);
+    const ULONGLONG deadlineMs = (lastDeliverTickMs_ != 0) ? (lastDeliverTickMs_ + frameMs) : 0ull;
+
+    while (deadlineMs != 0 && !isShutdown_) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadlineMs) {
+            break;
+        }
+        const uint64_t seqNow = ipc ? ipc->frameSequence.load(std::memory_order_acquire) : 0ull;
+        if (seqNow != 0 && seqNow != lastSeqDelivered_) {
+            lastSeqDelivered_ = seqNow;
+            break;
+        }
+        if (paceTimer_) {
+            LARGE_INTEGER due{};
+            due.QuadPart = -20000LL; // 2 ms
+            SetWaitableTimer(paceTimer_, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(paceTimer_, 5);
+        } else {
+            Sleep(2);
+        }
     }
     lastDeliverTickMs_ = GetTickCount64();
 }
@@ -1109,7 +1138,6 @@ IFACEMETHODIMP ZeroCamMediaStream::RequestSample(IUnknown* pToken) {
     }
 
     ZeroCamSharedMemory* ipc = ipcOpened_ ? ipc_.Data() : nullptr;
-    const uint64_t seq = ipc ? ipc->frameSequence.load(std::memory_order_acquire) : 0;
     UINT32 fpsNum = negotiatedFpsNum_;
     UINT32 fpsDen = negotiatedFpsDen_;
     if (ipc) {
@@ -1120,7 +1148,7 @@ IFACEMETHODIMP ZeroCamMediaStream::RequestSample(IUnknown* pToken) {
             fpsDen = rawDen;
         }
     }
-    PaceNextFrame(fpsNum, fpsDen, seq);
+    PaceNextFrame(ipc, fpsNum, fpsDen);
 
     Microsoft::WRL::ComPtr<IMFSample> sample;
     bool usedGpu = false;

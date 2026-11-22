@@ -673,7 +673,7 @@ void StreamIngest::UsbMonitorMain(uint16_t mobilePort) {
 
         const bool wakeTriggered = usbWakeRequested_.exchange(false, std::memory_order_acq_rel);
         const ULONGLONG nowMs = GetTickCount64();
-        const bool periodicWifiProbe = connectedNow && (lastWifiProbeMs == 0 || (nowMs - lastWifiProbeMs) >= 5000ull);
+        const bool periodicWifiProbe = connectedNow && (lastWifiProbeMs == 0 || (nowMs - lastWifiProbeMs) >= 15000ull);
         const bool shouldProbe = firstRun || wakeTriggered || (usbRetryBurst > 0) || !connectedNow || periodicWifiProbe;
 
         if (shouldProbe) {
@@ -702,7 +702,7 @@ void StreamIngest::UsbMonitorMain(uint16_t mobilePort) {
 
         const bool inWifiNow = clientConnected_.load(std::memory_order_acquire) &&
                                !clientIsLoopback_.load(std::memory_order_acquire);
-        const int waitTicks = (usbRetryBurst > 0) ? 15 : (inWifiNow ? 50 : 30);
+        const int waitTicks = (usbRetryBurst > 0) ? 15 : (inWifiNow ? 150 : 30);
         for (int i = 0; i < waitTicks && !stopRequested_.load(std::memory_order_acquire); ++i) {
             const bool nowConn = clientConnected_.load(std::memory_order_acquire);
             const bool nowUsb = nowConn && clientIsLoopback_.load(std::memory_order_acquire);
@@ -1185,6 +1185,7 @@ void StreamIngest::HandleTcpClient(SOCKET clientSock, uint32_t peerIpKey, MfHwDe
     std::vector<uint8_t> normalizedAu;
     std::vector<uint8_t> encPayload;
     std::vector<uint8_t> plainPayload;
+    int consecutiveSkips = 0;
 
     while (!stopRequested_.load(std::memory_order_acquire)) {
         WirePacketHeader hdr{};
@@ -1212,8 +1213,19 @@ void StreamIngest::HandleTcpClient(SOCKET clientSock, uint32_t peerIpKey, MfHwDe
             const uint8_t rot = ResolveRotationCode(ExtractRotationCode(hdr.flags));
             const uint32_t fps = targetFps_.load(std::memory_order_acquire);
             parser.NormalizeAccessUnit(plainPayload.data(), plainPayload.size(), normalizedAu, kf);
-            if (decoder.DecodeAccessUnit(normalizedAu.data(), normalizedAu.size(), static_cast<int64_t>(hdr.ptsUs), fps, 1, rot)) {
-                RecordFrame(decoder.Width(), decoder.Height(), decoder.IsHwAccelerated() && decoder.HwZeroCopyFrames() > 0);
+
+            u_long availBytes = 0;
+            const bool hasBacklog = (ioctlsocket(clientSock, FIONREAD, &availBytes) == 0) &&
+                                    (availBytes >= sizeof(WirePacketHeader) + 512u);
+            const bool skipPublish = hasBacklog && (consecutiveSkips < 4);
+
+            if (decoder.DecodeAccessUnit(normalizedAu.data(), normalizedAu.size(), static_cast<int64_t>(hdr.ptsUs), fps, 1, rot, skipPublish)) {
+                if (skipPublish) {
+                    ++consecutiveSkips;
+                } else {
+                    consecutiveSkips = 0;
+                    RecordFrame(decoder.Width(), decoder.Height(), decoder.IsHwAccelerated() && decoder.HwZeroCopyFrames() > 0);
+                }
             }
         }
     }

@@ -2,11 +2,14 @@ package com.zerocam.mobile
 
 import java.io.BufferedOutputStream
 import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.interfaces.ECPublicKey
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -25,20 +28,33 @@ data class WireHandshakeResult(
  * Cliente TCP cifrado de baja latencia bajo ZeroCam Wire v2 (ECDH/ECDSA P-256 + AES-256-GCM).
  */
 class TcpStreamClient(
-    private val onControlJson: ((String) -> Unit)? = null
+    private val onControlJson: ((String) -> Unit)? = null,
+    private val onCongestionRequestKeyFrame: (() -> Unit)? = null
 ) {
+    private class QueuedVideoFrame(
+        val payload: ByteArray,
+        val ptsUs: Long,
+        val isKeyframe: Boolean,
+        val hasConfig: Boolean,
+        val rotationDegreesCw: Int
+    )
+
     private val connected = AtomicBoolean(false)
     private val sendLock = Any()
     private val bytesSentWindow = AtomicLong(0)
     private val framesSentTotal = AtomicLong(0)
+    private val videoQueue = ArrayBlockingQueue<QueuedVideoFrame>(4)
 
     @Volatile private var socket: Socket? = null
     @Volatile private var connectingSocket: Socket? = null
-    @Volatile private var outStream: BufferedOutputStream? = null
+    @Volatile private var outStream: OutputStream? = null
     @Volatile private var sendCipher: Aes256GcmCipher? = null
     @Volatile private var lastActivityMs: Long = 0L
+    @Volatile private var dropUntilKeyframe: Boolean = false
+    @Volatile private var lastCongestionIdrMs: Long = 0L
     private var connectGeneration: Long = 0L
     private var readerThread: Thread? = null
+    private var senderThread: Thread? = null
 
     fun isConnected(): Boolean = connected.get()
     fun totalFramesSent(): Long = framesSentTotal.get()
@@ -165,7 +181,7 @@ class TcpStreamClient(
         return try {
             sock = Socket()
             sock.tcpNoDelay = true
-            sock.sendBufferSize = 512 * 1024
+            sock.sendBufferSize = if (isUsb) 256 * 1024 else 128 * 1024
             sock.soTimeout = maxOf(timeoutMs, 6000)
             // Registra el socket en vuelo para que disconnect() pueda abortar inmediatamente un handshake bloqueado.
             synchronized(sendLock) {
@@ -177,7 +193,8 @@ class TcpStreamClient(
             sock.connect(InetSocketAddress(host, port), timeoutMs)
 
             val input = sock.getInputStream()
-            val rawOut = BufferedOutputStream(sock.getOutputStream(), 128 * 1024)
+            val rawOut = BufferedOutputStream(sock.getOutputStream(), 4096)
+            val directOut = sock.getOutputStream()
 
             // 1. Mensaje ClientHello (nonce[16] || clientEphPub[65])
             val clientNonce = WireCrypto.randomBytes(WireCrypto.NONCE_BYTES)
@@ -316,6 +333,8 @@ class TcpStreamClient(
             derivedKeys = null
 
             sock.soTimeout = 0
+            videoQueue.clear()
+            dropUntilKeyframe = false
             val promoted = synchronized(sendLock) {
                 if (connectingSocket === sock) {
                     connectingSocket = null
@@ -324,7 +343,7 @@ class TcpStreamClient(
                     false
                 } else {
                     socket = sock
-                    outStream = rawOut
+                    outStream = directOut
                     sendCipher = c2sCipher
                     lastActivityMs = System.currentTimeMillis()
                     connected.set(true)
@@ -339,6 +358,7 @@ class TcpStreamClient(
             val activeS2c = s2cCipher
             c2sCipher = null
             s2cCipher = null
+            startSenderThread(sock)
             startControlReader(sock, input, activeS2c)
             WireHandshakeResult(ok = true, serverFpHex = serverFpHex, serverPubHex = serverPubHex)
         } catch (e: Exception) {
@@ -357,7 +377,7 @@ class TcpStreamClient(
     }
 
     /**
-     * Cifra con AES-256-GCM y envía un Access Unit H.264 bajo sendLock garantizando unicidad de nonce.
+     * Encola un Access Unit H.264 sin bloquear MediaCodec y descarta P-frames atrasados ante congestión Wi-Fi.
      */
     fun sendVideoPacket(
         payload: ByteArray,
@@ -367,32 +387,28 @@ class TcpStreamClient(
         rotationDegreesCw: Int = 0
     ): Boolean {
         if (!connected.get() || payload.size > 8 * 1024 * 1024) return false
-        val flags = WireProtocol.packFlags(isKeyframe, hasConfig, rotationDegreesCw)
-        val header = WireProtocol.encodeHeader(
-            type = WireProtocol.TYPE_VIDEO_H264,
-            flags = flags,
-            ptsUs = ptsUs,
-            payloadSize = payload.size + WireCrypto.AEAD_TAG_BYTES
-        )
-
-        return synchronized(sendLock) {
-            if (!connected.get()) return@synchronized false
-            val out = outStream ?: return@synchronized false
-            val cipher = sendCipher ?: return@synchronized false
-            try {
-                val ctAndTag = cipher.encryptNext(header, payload)
-                out.write(header)
-                out.write(ctAndTag)
-                out.flush()
-                lastActivityMs = System.currentTimeMillis()
-                bytesSentWindow.addAndGet((header.size + ctAndTag.size).toLong())
-                framesSentTotal.incrementAndGet()
-                true
-            } catch (_: Exception) {
-                disconnect()
-                false
-            }
+        if (dropUntilKeyframe) {
+            if (!isKeyframe) return false
+            dropUntilKeyframe = false
         }
+
+        val frame = QueuedVideoFrame(payload, ptsUs, isKeyframe, hasConfig, rotationDegreesCw)
+        if (videoQueue.offer(frame)) {
+            return true
+        }
+
+        // Cola saturada: descarta backlog para evitar bufferbloat y solicita IDR fresco si era delta P-frame.
+        videoQueue.clear()
+        if (isKeyframe) {
+            return videoQueue.offer(frame)
+        }
+        dropUntilKeyframe = true
+        val now = System.currentTimeMillis()
+        if (now - lastCongestionIdrMs >= 400L) {
+            lastCongestionIdrMs = now
+            try { onCongestionRequestKeyFrame?.invoke() } catch (_: Exception) {}
+        }
+        return false
     }
 
     /**
@@ -413,8 +429,10 @@ class TcpStreamClient(
             val cipher = sendCipher ?: return@synchronized false
             try {
                 val ctAndTag = cipher.encryptNext(header, body)
-                out.write(header)
-                out.write(ctAndTag)
+                val pkt = ByteArray(header.size + ctAndTag.size)
+                System.arraycopy(header, 0, pkt, 0, header.size)
+                System.arraycopy(ctAndTag, 0, pkt, header.size, ctAndTag.size)
+                out.write(pkt)
                 out.flush()
                 lastActivityMs = System.currentTimeMillis()
                 true
@@ -426,10 +444,12 @@ class TcpStreamClient(
     }
 
     /**
-     * Cierra el socket activo (y cualquier handshake en vuelo), limpia cifradores AEAD y detiene el hilo lector.
+     * Cierra el socket activo (y cualquier handshake en vuelo), limpia cifradores AEAD y detiene los hilos de I/O.
      */
     fun disconnect() {
         connected.set(false)
+        dropUntilKeyframe = false
+        videoQueue.clear()
         val inFlight: Socket?
         synchronized(sendLock) {
             connectGeneration++
@@ -443,8 +463,61 @@ class TcpStreamClient(
             socket = null
         }
         try { inFlight?.close() } catch (_: Exception) {}
+        senderThread?.interrupt()
+        senderThread = null
         readerThread?.interrupt()
         readerThread = null
+    }
+
+    private fun startSenderThread(sock: Socket) {
+        val t = Thread({
+            try {
+                while (connected.get() && socket === sock && !Thread.currentThread().isInterrupted) {
+                    val item = try {
+                        videoQueue.poll(200, TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        break
+                    } ?: continue
+
+                    if (!connected.get() || socket !== sock) break
+                    val flags = WireProtocol.packFlags(item.isKeyframe, item.hasConfig, item.rotationDegreesCw)
+                    val header = WireProtocol.encodeHeader(
+                        type = WireProtocol.TYPE_VIDEO_H264,
+                        flags = flags,
+                        ptsUs = item.ptsUs,
+                        payloadSize = item.payload.size + WireCrypto.AEAD_TAG_BYTES
+                    )
+                    val ok = synchronized(sendLock) {
+                        if (!connected.get() || socket !== sock) return@synchronized false
+                        val out = outStream ?: return@synchronized false
+                        val cipher = sendCipher ?: return@synchronized false
+                        try {
+                            val ctAndTag = cipher.encryptNext(header, item.payload)
+                            val pkt = ByteArray(header.size + ctAndTag.size)
+                            System.arraycopy(header, 0, pkt, 0, header.size)
+                            System.arraycopy(ctAndTag, 0, pkt, header.size, ctAndTag.size)
+                            out.write(pkt)
+                            out.flush()
+                            lastActivityMs = System.currentTimeMillis()
+                            bytesSentWindow.addAndGet(pkt.size.toLong())
+                            framesSentTotal.incrementAndGet()
+                            true
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+                    if (!ok) {
+                        if (socket === sock) disconnect()
+                        break
+                    }
+                }
+            } catch (_: Exception) {
+                if (socket === sock) disconnect()
+            }
+        }, "ZeroCamTcpSender")
+        t.isDaemon = true
+        t.start()
+        senderThread = t
     }
 
     private fun failClose(sock: Socket, code: Byte, msg: String): WireHandshakeResult {

@@ -45,6 +45,7 @@ class HardwareEncoder(
                 if (Build.VERSION.SDK_INT >= 30) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
             }
 
             val mc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)

@@ -82,6 +82,7 @@ MainWindow::~MainWindow() {
     closing_.store(true, std::memory_order_release);
     StopCameraWorker();
     ingest_.Stop();
+    d3dCtx_.SetProducerActive(false);
     AdbBridge::ShutdownBundledAdb();
     vcam_.Stop();
     preview_.SetEnabled(false);
@@ -122,7 +123,7 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     hwnd_ = CreateWindowExW(
         0,
         wc.lpszClassName,
-        L"ZeroCam v1.2.5 — Cámara Virtual Zero-Copy",
+        L"ZeroCam v1.3.0 — Cámara Virtual Zero-Copy",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
         nullptr, nullptr, hInstance_, this);
@@ -206,6 +207,7 @@ bool MainWindow::Create(HINSTANCE hInstance) {
     AddTrayIcon();
 
     // Evalúa COM/DLL una sola vez al iniciar (cero I/O repetido en el timer de UI).
+    lastMfSupported_ = VirtualCameraHost::IsMfVirtualCameraSupported();
     lastPlatformSupported_ = VirtualCameraHost::IsPlatformSupported();
     lastComReady_ = lastPlatformSupported_ &&
                     VirtualCameraHost::IsComRegistered() &&
@@ -566,12 +568,12 @@ void MainWindow::Paint(HDC targetDc) {
         leftStatus = lastActionMsg_.empty() ? L"Aplicando cambios..." : lastActionMsg_;
     } else if (vcamRunningCached_) {
         footDot = ui::kStatusSuccess;
-        leftStatus = L"Cámara Virtual Activa (OBS / Zoom / Discord)";
+        leftStatus = lastMfSupported_
+            ? L"Cámara Virtual Activa (OBS / Zoom / Discord)"
+            : L"Cámara Virtual Activa W10 (DirectShow • OBS / Zoom / Discord)";
     } else if (cameraRunning_) {
         footDot = ui::kStatusWarning;
-        leftStatus = !lastPlatformSupported_
-            ? L"Modo Receptor + Vista Previa (W10)"
-            : (lastActionMsg_.empty() ? lastTelemetry_.statusText : lastActionMsg_);
+        leftStatus = lastActionMsg_.empty() ? lastTelemetry_.statusText : lastActionMsg_;
     } else {
         leftStatus = !lastActionMsg_.empty()
             ? lastActionMsg_
@@ -738,9 +740,11 @@ void MainWindow::CameraWorkerMain() {
             const bool ready = EnsureVirtualCameraReady();
             std::wstring err;
             const bool vcamStarted = ready && vcam_.Start(err);
+            d3dCtx_.SetProducerActive(true);
             const bool ingOk = ingest_.Start(req.mode, req.endpoint, &d3dCtx_, &preview_);
             if (!vcamStarted) {
                 if (!ingOk) {
+                    d3dCtx_.SetProducerActive(false);
                     workerRunning = false;
                     workerTestPattern = false;
                     res->actionMsg = L"No se pudo iniciar el motor de recepción.";
@@ -748,15 +752,12 @@ void MainWindow::CameraWorkerMain() {
                     workerRunning = true;
                     workerTestPattern = req.testPattern;
                     res->forcePreviewOn = true;
-                    if (!lastPlatformSupported_) {
-                        res->actionMsg = L"Windows 10 detectado: la cámara virtual requiere Windows 11 (Modo Vista Previa activo).";
-                    } else {
-                        res->actionMsg = (ready && !err.empty())
-                            ? L"Modo Receptor + Vista Previa activo (esperando Android)."
-                            : L"Permiso omitido: Modo Receptor + Vista Previa activo.";
-                    }
+                    res->actionMsg = (ready && !err.empty())
+                        ? (L"Error cámara virtual: " + err + L" (Modo Vista Previa activo)")
+                        : (!err.empty() ? err : L"Permiso omitido: Modo Receptor + Vista Previa activo.");
                 }
             } else if (!ingOk) {
+                d3dCtx_.SetProducerActive(false);
                 vcam_.Stop();
                 workerRunning = false;
                 workerTestPattern = false;
@@ -764,7 +765,9 @@ void MainWindow::CameraWorkerMain() {
             } else {
                 workerRunning = true;
                 workerTestPattern = req.testPattern;
-                res->actionMsg = L"Cámara virtual activa ('ZeroCam Virtual Camera').";
+                res->actionMsg = VirtualCameraHost::IsMfVirtualCameraSupported()
+                    ? L"Cámara virtual activa ('ZeroCam Virtual Camera')."
+                    : L"Cámara DirectShow activa en Windows 10 ('ZeroCam Virtual Camera').";
             }
             res->cameraRunning = workerRunning;
             res->vcamActive = vcam_.IsRunning();
@@ -776,6 +779,7 @@ void MainWindow::CameraWorkerMain() {
         }
         case CameraOpKind::Stop:
             ingest_.Stop();
+            d3dCtx_.SetProducerActive(false);
             vcam_.Stop();
             workerRunning = false;
             workerTestPattern = false;
@@ -837,6 +841,7 @@ void MainWindow::CameraWorkerMain() {
     }
 
     ingest_.Stop();
+    d3dCtx_.SetProducerActive(false);
     AdbBridge::ShutdownBundledAdb();
     vcam_.Stop();
     MFShutdown();

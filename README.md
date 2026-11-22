@@ -1,6 +1,6 @@
-# ZeroCam `v1.2.5`
+# ZeroCam `v1.3.0`
 
-Cámara virtual de ultra baja latencia y código limpio para **Windows 11 x64** y **Android 8.0+**, con pipeline de video H.264 acelerado por hardware **Zero-Copy** de extremo a extremo y transporte autenticado/cifrado **`ZeroCam Wire v2`**.
+Cámara virtual de ultra baja latencia y código limpio para **Windows 10 / Windows 11 x64** y **Android 8.0+**, con pipeline de video H.264 acelerado por hardware **Zero-Copy** de extremo a extremo y transporte autenticado/cifrado **`ZeroCam Wire v2`**.
 
 ---
 
@@ -20,9 +20,11 @@ flowchart LR
         GPU --> IPC["Ring Compartido NV12\n(ipc_ring.bin ACL protegida)"]
     end
 
-    subgraph VCam["Windows FrameServer COM"]
-        IPC -->|OpenSharedResource / CPU fallback| DLL["ZeroCamSource.dll\n(IMFDXGIBuffer Zero-Copy)"]
+    subgraph VCam["Windows FrameServer / DirectShow"]
+        IPC -->|OpenSharedResource Zero-Copy Win11| DLL["ZeroCamSource.dll\n(IMFDXGIBuffer)"]
+        IPC -->|CPU NV12 / YUY2 Win10 32/64-bit| DS["ZeroCamDShow64/32.dll\n(DirectShow Filter)"]
         DLL --> APPS["OBS / Zoom / Discord / Meet / Cámara Windows"]
+        DS --> APPS
     end
 
     NET <-->|TCP 5000..5010 cifrado + UDP Discovery v2 :5001| ING
@@ -64,8 +66,9 @@ flowchart LR
 │   ├── shared/                     # Protocolo Wire v2, criptografía CNG/DPAPI, IPC compartido NV12 y GUIDs COM
 │   ├── app/                        # Aplicación Win32 Dark Mode, D3D11VA/DirectML, StreamIngest, AdbBridge y VirtualCameraHost
 │   │   └── res/                    # Icono zerocam.ico y modelo RVM ONNX embebido (sin fallback externo)
-│   ├── vcam_source/                # Servidor COM In-Proc ZeroCamSource.dll para Windows FrameServer
-│   └── tests/                      # Suite end-to-end zerocam_selftest.cpp (67 aserciones)
+│   ├── vcam_source/                # Servidor COM In-Proc ZeroCamSource.dll (Windows 11 FrameServer)
+│   ├── dshow_source/               # Filtro DirectShow clean-room 64/32-bit (Windows 10 Discord/OBS)
+│   └── tests/                      # Suite end-to-end zerocam_selftest.cpp
 ├── android/
 │   ├── app/src/main/               # App Android Kotlin (Camera2, MediaCodec HW, TcpStreamClient, WireCrypto, UI)
 │   ├── app/src/test/               # Pruebas unitarias JUnit (WireProtocolTest.kt — vectores cruzados CNG <-> JCA)
@@ -110,7 +113,7 @@ gradle testDebugUnitTest assembleRelease --no-daemon
 
 ### 3. Empaquetado completo (Windows + Android + Instalador)
 ```powershell
-.\scripts\package_release.ps1 -Version "1.2.5"
+.\scripts\package_release.ps1 -Version "1.3.0"
 ```
 Genera los artefactos finales dentro de `dist/` (excluidos del control de versiones).
 

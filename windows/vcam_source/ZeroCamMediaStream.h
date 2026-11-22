@@ -86,8 +86,8 @@ private:
     HRESULT EnsureAllocatorInitialized();
     // Produce un IMFSample NV12 en memoria del sistema o vía allocator externo (fallback o patrón standby).
     HRESULT CreateCpuOrStandbySample(ZeroCamSharedMemory* ipc, IMFSample** ppSample);
-    // Sincroniza cadencia de entrega para evitar busy-wait si el consumidor solicita sin vsync.
-    void PaceNextFrame(UINT32 fpsNum, UINT32 fpsDen, uint64_t currentSeq);
+    // Sincroniza cadencia con espera reactiva de alta resolución sin congelar un frame entero.
+    void PaceNextFrame(ZeroCamSharedMemory* ipc, UINT32 fpsNum, UINT32 fpsDen);
 
     std::atomic<ULONG> refCount_{ 1 };
     std::mutex mutex_;
@@ -151,6 +151,7 @@ private:
     int64_t nextSampleTimeHns_ = 0;
     uint64_t lastSeqDelivered_ = 0;
     ULONGLONG lastDeliverTickMs_ = 0;
+    HANDLE paceTimer_ = nullptr;
 };
 
 } // namespace zerocam

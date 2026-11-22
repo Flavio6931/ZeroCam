@@ -2,6 +2,16 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.0] - 2026-11-21
+### Añadido y Mejorado
+- **Compatibilidad universal Windows 10 + Windows 11 y detección fiable en Discord:**
+  - Carga dinámica de `mfsensorgroup.dll` eliminando el enlace estático exclusivo de Windows 11 en `ZeroCam.exe`.
+  - **Windows 11:** registro persistente de sistema (`MFVirtualCameraLifetime_System` + `MFVirtualCameraAccess_AllUsers` + `{ KSCATEGORY_VIDEO_CAMERA, KSCATEGORY_CAPTURE }`) evitando aislamiento UAC con Discord, más `runasoriginaluser` en Inno Setup.
+  - **Windows 10:** nuevo filtro DirectShow clean-room sin BaseClasses (`ZeroCamDShow64.dll` x64 y `ZeroCamDShow32.dll` x86) con `IAMStreamConfig`, `IKsPropertySet` (`PIN_CATEGORY_CAPTURE`) y soporte **NV12 + YUY2**, sin generar cámaras duplicadas en Windows 11.
+- **Pipeline Anti-Lag extremo a extremo (`0%` GPU extra):**
+  - Android: `KEY_PRIORITY = 0` en MediaCodec H.264, `sendBufferSize` acotado (`128 KB` Wi-Fi / `256 KB` USB) sin buffer intermedio de `128 KB`, y cola de `4` frames en hilo emisor dedicado (`ZeroCamTcpSender`) con descarte de P-frames atrasados y solicitud automática de IDR ante congestión.
+  - Windows PC y cámara virtual: espera reactiva de `2 ms` (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) en `ZeroCamMediaStream` y DirectShow, salto de renderizado de frames atrasados en backlog TCP (`FIONREAD` + `skipPublish`), liberación temprana de `KeyedMutex` en fallback CPU y sondeo Wi-Fi→USB relajado a `15 s`.
+
 ## [1.2.5] - 2026-11-21
 ### Mejorado
 - **Minimizar directo a bandeja del sistema (`MainWindow`):** pulsar el botón `—` (`SC_MINIMIZE`) oculta la ventana directamente al icono del área de notificación y detiene el renderizado de vista previa (`0.0% GPU 3D`) manteniendo activa la cámara virtual.

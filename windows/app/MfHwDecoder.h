@@ -27,14 +27,15 @@ public:
     // Cierra y libera el transformador de Media Foundation.
     void Shutdown();
 
-    // Envía un Access Unit H.264 Annex-B y publica cada frame decodificado (rotado HW si rotationCode != 0).
+    // Envía un Access Unit H.264 Annex-B y publica cada frame decodificado (o salta publicación si skipPublish=true).
     bool DecodeAccessUnit(
         const uint8_t* data,
         size_t size,
         int64_t ptsUs,
         uint32_t fpsNum = 30,
         uint32_t fpsDen = 1,
-        uint8_t rotationCode = 0);
+        uint8_t rotationCode = 0,
+        bool skipPublish = false);
     // Drena frames pendientes al finalizar un archivo o flujo.
     void DrainAll(uint32_t fpsNum = 30, uint32_t fpsDen = 1);
 
@@ -49,7 +50,7 @@ private:
     // Selecciona NV12 como tipo de salida del MFT y lee el tamaño visible sin padding de macrobloques.
     bool ConfigureOutputType();
     // Extrae todas las muestras listas del MFT tras ProcessInput o Drain.
-    bool PullOutputs(uint32_t fpsNum, uint32_t fpsDen);
+    bool PullOutputs(uint32_t fpsNum, uint32_t fpsDen, bool skipPublish = false);
 
     D3D11Context* d3dCtx_ = nullptr;
     PreviewRenderer* preview_ = nullptr;

@@ -108,6 +108,7 @@ private:
     TelemetrySnapshot lastTelemetry_{};
     bool lastComReady_ = false;
     bool lastPlatformSupported_ = true;
+    bool lastMfSupported_ = true;
 
     enum class ActiveDrawer { None, Settings, Effects };
     bool cameraRunning_ = false;

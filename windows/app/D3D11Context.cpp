@@ -97,6 +97,19 @@ void D3D11Context::Shutdown() {
     ringW_ = ringH_ = stagingW_ = stagingH_ = testW_ = testH_ = 0;
 }
 
+void D3D11Context::SetProducerActive(bool active) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (ZeroCamSharedMemory* mem = ipc_.Data()) {
+        if (active) {
+            mem->producerAlive.store(GetCurrentProcessId(), std::memory_order_release);
+        } else {
+            mem->producerAlive.store(0u, std::memory_order_release);
+            mem->frameSequence.store(0ull, std::memory_order_release);
+            mem->cpuFrameMeta.store(0ull, std::memory_order_release);
+        }
+    }
+}
+
 bool D3D11Context::EnsureSharedRing(uint32_t width, uint32_t height) {
     if (ringW_ == width && ringH_ == height && ringTextures_[0] != nullptr) {
         return true;
@@ -190,17 +203,25 @@ bool D3D11Context::EnsureStagingTexture(uint32_t width, uint32_t height) {
     return true;
 }
 
-void D3D11Context::CopySlotToCpuFallback(ID3D11Texture2D* gpuTex, uint32_t width, uint32_t height) {
-    ZeroCamSharedMemory* mem = ipc_.Data();
-    if (!mem || width < 2u || height < 2u || (width & 1u) != 0u || (height & 1u) != 0u ||
+bool D3D11Context::StageSlotToCpuTexture(ID3D11Texture2D* gpuTex, uint32_t width, uint32_t height) {
+    if (!gpuTex || !context_ || width < 2u || height < 2u || (width & 1u) != 0u || (height & 1u) != 0u ||
         width > kMaxCpuWidth || height > kMaxCpuHeight) {
-        return;
+        return false;
     }
     if (!EnsureStagingTexture(width, height)) {
+        return false;
+    }
+    context_->CopyResource(stagingTex_.Get(), gpuTex);
+    return true;
+}
+
+void D3D11Context::ReadStagedCpuFallback(uint32_t width, uint32_t height) {
+    ZeroCamSharedMemory* mem = ipc_.Data();
+    if (!mem || !stagingTex_ || !context_ || width < 2u || height < 2u ||
+        (width & 1u) != 0u || (height & 1u) != 0u || width > kMaxCpuWidth || height > kMaxCpuHeight) {
         return;
     }
 
-    context_->CopyResource(stagingTex_.Get(), gpuTex);
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(context_->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         return;
@@ -411,20 +432,23 @@ bool D3D11Context::PublishGpuFrame(
             effectsPipeline_.Process(
                 srcTex, subresourceIndex, visibleWidth, visibleHeight, rotationCode,
                 fxCfg, ringTextures_[slot].Get(), &fxPreview)) {
+            ZeroCamSharedMemory* mem = ipc_.Data();
+            bool stagedCpu = false;
+            if (mem && mem->clientNeedsCpuFallback.load(std::memory_order_acquire) != 0) {
+                stagedCpu = StageSlotToCpuTexture(ringTextures_[slot].Get(), visibleWidth, visibleHeight);
+            }
             if (!usesKeyedMutex_) {
                 context_->Flush();
             } else if (ringMutexes_[slot]) {
                 ringMutexes_[slot]->ReleaseSync(0);
             }
 
-            if (ZeroCamSharedMemory* mem = ipc_.Data()) {
-                if (mem->clientNeedsCpuFallback.load(std::memory_order_acquire) != 0) {
-                    if (!usesKeyedMutex_ || (ringMutexes_[slot] && SUCCEEDED(ringMutexes_[slot]->AcquireSync(0, 16)))) {
-                        CopySlotToCpuFallback(ringTextures_[slot].Get(), visibleWidth, visibleHeight);
-                        if (usesKeyedMutex_ && ringMutexes_[slot]) {
-                            ringMutexes_[slot]->ReleaseSync(0);
-                        }
-                    }
+            if (mem) {
+                if (mem->producerAlive.load(std::memory_order_relaxed) == 0u) {
+                    mem->producerAlive.store(GetCurrentProcessId(), std::memory_order_release);
+                }
+                if (stagedCpu) {
+                    ReadStagedCpuFallback(visibleWidth, visibleHeight);
                 }
                 mem->width.store(visibleWidth, std::memory_order_release);
                 mem->height.store(visibleHeight, std::memory_order_release);
@@ -455,20 +479,23 @@ bool D3D11Context::PublishGpuFrame(
         context_->CopySubresourceRegion(ringTextures_[slot].Get(), 0, 0, 0, 0, srcTex, subresourceIndex, &srcBox);
     }
 
+    ZeroCamSharedMemory* mem = ipc_.Data();
+    bool stagedCpu = false;
+    if (mem && mem->clientNeedsCpuFallback.load(std::memory_order_acquire) != 0) {
+        stagedCpu = StageSlotToCpuTexture(ringTextures_[slot].Get(), visibleWidth, visibleHeight);
+    }
     if (!usesKeyedMutex_) {
         context_->Flush();
     } else if (ringMutexes_[slot]) {
         ringMutexes_[slot]->ReleaseSync(0);
     }
 
-    if (ZeroCamSharedMemory* mem = ipc_.Data()) {
-        if (mem->clientNeedsCpuFallback.load(std::memory_order_acquire) != 0) {
-            if (!usesKeyedMutex_ || (ringMutexes_[slot] && SUCCEEDED(ringMutexes_[slot]->AcquireSync(0, 16)))) {
-                CopySlotToCpuFallback(ringTextures_[slot].Get(), visibleWidth, visibleHeight);
-                if (usesKeyedMutex_ && ringMutexes_[slot]) {
-                    ringMutexes_[slot]->ReleaseSync(0);
-                }
-            }
+    if (mem) {
+        if (mem->producerAlive.load(std::memory_order_relaxed) == 0u) {
+            mem->producerAlive.store(GetCurrentProcessId(), std::memory_order_release);
+        }
+        if (stagedCpu) {
+            ReadStagedCpuFallback(visibleWidth, visibleHeight);
         }
         mem->width.store(visibleWidth, std::memory_order_release);
         mem->height.store(visibleHeight, std::memory_order_release);
@@ -530,6 +557,9 @@ bool D3D11Context::PublishCpuNv12Frame(
     else if (ringMutexes_[slot]) ringMutexes_[slot]->ReleaseSync(0);
 
     if (ZeroCamSharedMemory* mem = ipc_.Data()) {
+        if (mem->producerAlive.load(std::memory_order_relaxed) == 0u) {
+            mem->producerAlive.store(GetCurrentProcessId(), std::memory_order_release);
+        }
         if (mem->clientNeedsCpuFallback.load(std::memory_order_acquire) != 0 &&
             width >= 2u && height >= 2u && (width & 1u) == 0u && (height & 1u) == 0u &&
             width <= kMaxCpuWidth && height <= kMaxCpuHeight) {

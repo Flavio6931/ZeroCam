@@ -32,6 +32,8 @@ public:
     bool Initialize(bool allowTempIpcFallback = true);
     // Libera recursos D3D11 y marca el productor como inactivo en IPC.
     void Shutdown();
+    // Actualiza el estado activo/standby del productor para cámaras virtuales persistentes.
+    void SetProducerActive(bool active);
 
     // Publica un frame NV12 directamente VRAM->VRAM (o aplica filtros GPU D3D11 + IA si están activos).
     bool PublishGpuFrame(
@@ -93,8 +95,10 @@ private:
     bool BlitRotatedHw(ID3D11Texture2D* srcTex, UINT subresourceIdx, ID3D11Texture2D* dstTex, uint32_t w, uint32_t h, uint8_t rotCode);
     // (Re)crea la textura staging bajo demanda solo si el consumidor solicitó fallback CPU.
     bool EnsureStagingTexture(uint32_t width, uint32_t height);
-    // Copia un slot GPU hacia cpuNv12Buffer únicamente cuando clientNeedsCpuFallback != 0.
-    void CopySlotToCpuFallback(ID3D11Texture2D* gpuTex, uint32_t width, uint32_t height);
+    // Copia VRAM->staging bajo KeyedMutex antes de liberarlo (sin Map bajo lock compartido).
+    bool StageSlotToCpuTexture(ID3D11Texture2D* gpuTex, uint32_t width, uint32_t height);
+    // Lee staging->cpuNv12Buffer fuera del KeyedMutex compartido.
+    void ReadStagedCpuFallback(uint32_t width, uint32_t height);
 
     std::mutex mutex_;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
