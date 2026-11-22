@@ -2,6 +2,13 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.3] - 2026-11-21
+### Corregido y Mejorado
+- **Negociación HD 16:9 garantizada en Discord (sin zoom ni borrosidad `640×480`):**
+  - `ZeroCamDShowFilter`: eliminados los 3 modos `640×480` (`4:3`) de las capacidades anunciadas (`kDShowModes[]`), dejando exclusivamente los **12 modos HD `16:9`** (`1280×720` y `1920×1080` a `30/60 fps` en `I420`, `NV12` y `YUY2`), con `MinOutputSize = 1280×720`. Así Discord abre la cámara mínimo en `1280×720` encuadre completo sin recortar bordes.
+- **Reemplazo en caliente de DLLs bloqueadas en actualización (`VirtualCameraHost::CopyAndHardenDll`):**
+  - Si Discord u OBS mantiene mapeada `ZeroCamDShow64/32.dll` al actualizar, la DLL bloqueada se renombra automáticamente a `*.old.<tick>` (marcada con `MOVEFILE_DELAY_UNTIL_REBOOT` y limpieza previa `CleanupStaleOldDlls`) para copiar la nueva versión al instante sin mostrar el aviso `Permiso omitido`.
+
 ## [1.3.2] - 2026-11-21
 ### Mejorado
 - **Calidad visual nítida en Discord (`I420` nativo + supersampling bilineal sin GPU extra):**

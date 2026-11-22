@@ -195,20 +195,23 @@ void RunDShowSelfTests(
 
             Microsoft::WRL::ComPtr<IAMStreamConfig> scfg;
             int capCount = 0, capSize = 0;
-            bool hasI420Cap = false, hasYuy2Cap = false, hasNv12Cap = false;
+            bool hasI420Cap = false, hasYuy2Cap = false, hasNv12Cap = false, hasSd480 = false;
             AM_MEDIA_TYPE* i420Mt = nullptr;
             AM_MEDIA_TYPE* yuy2Mt = nullptr;
             AM_MEDIA_TYPE* nv12Mt = nullptr;
 
             if (ksOk && SUCCEEDED(outPin.As(&scfg)) &&
                 SUCCEEDED(scfg->GetNumberOfCapabilities(&capCount, &capSize)) &&
-                capCount >= 15 && capSize == sizeof(VIDEO_STREAM_CONFIG_CAPS)) {
+                capCount == 12 && capSize == sizeof(VIDEO_STREAM_CONFIG_CAPS)) {
                 std::vector<BYTE> sccBuf(static_cast<size_t>(capSize));
                 for (int i = 0; i < capCount; ++i) {
                     AM_MEDIA_TYPE* cmt = nullptr;
                     if (scfg->GetStreamCaps(i, &cmt, sccBuf.data()) == S_OK && cmt) {
                         if (cmt->formattype == FORMAT_VideoInfo && cmt->cbFormat >= sizeof(VIDEOINFOHEADER) && cmt->pbFormat) {
                             const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(cmt->pbFormat);
+                            if (vih->bmiHeader.biWidth == 640 && vih->bmiHeader.biHeight == 480) {
+                                hasSd480 = true;
+                            }
                             if (vih->bmiHeader.biWidth == 1280 && vih->bmiHeader.biHeight == 720) {
                                 if (cmt->subtype == kMediaSubtypeI420 && !i420Mt) {
                                     i420Mt = cmt;
@@ -232,7 +235,7 @@ void RunDShowSelfTests(
                     }
                 }
             }
-            outMetaOk = ksOk && hasI420Cap && hasYuy2Cap && hasNv12Cap;
+            outMetaOk = ksOk && hasI420Cap && hasYuy2Cap && hasNv12Cap && !hasSd480;
 
             ZeroCamSharedMemory* ipc = d3dCtx.Ipc();
             bool i420BilinearOk = false;

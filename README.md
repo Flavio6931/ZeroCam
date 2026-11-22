@@ -1,4 +1,4 @@
-# ZeroCam `v1.3.2`
+# ZeroCam `v1.3.3`
 
 Cámara virtual de ultra baja latencia y código limpio para **Windows 10 / Windows 11 x64** y **Android 8.0+**, con pipeline de video H.264 acelerado por hardware **Zero-Copy** de extremo a extremo y transporte autenticado/cifrado **`ZeroCam Wire v2`**.
 
@@ -113,7 +113,7 @@ gradle testDebugUnitTest assembleRelease --no-daemon
 
 ### 3. Empaquetado completo (Windows + Android + Instalador)
 ```powershell
-.\scripts\package_release.ps1 -Version "1.3.2"
+.\scripts\package_release.ps1 -Version "1.3.3"
 ```
 Genera los artefactos finales dentro de `dist/` (excluidos del control de versiones).
 

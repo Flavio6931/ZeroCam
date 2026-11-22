@@ -281,15 +281,45 @@ bool QueryClsidInprocPath(const wchar_t* clsidString, REGSAM wowFlag, std::wstri
     return GetFileAttributesW(pathBuf) != INVALID_FILE_ATTRIBUTES;
 }
 
+void CleanupStaleOldDlls(const std::wstring& dirPath) noexcept {
+    if (dirPath.empty() || IsPathReparsePoint(dirPath)) return;
+    const std::wstring pattern = dirPath + L"\\*.old*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) {
+            const std::wstring full = dirPath + L"\\" + fd.cFileName;
+            DeleteFileW(full.c_str());
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+}
+
 bool CopyAndHardenDll(const std::wstring& srcPath, const std::wstring& dstPath) {
     if (!ValidateExistingFileOrMissing(dstPath)) return false;
     bool copied = false;
-    for (int tries = 0; tries < 10; ++tries) {
+    for (int tries = 0; tries < 3; ++tries) {
         if (CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE)) {
             copied = true;
             break;
         }
-        Sleep(150);
+        Sleep(100);
+    }
+    if (!copied && IsExistingRegularFile(dstPath)) {
+        // Si otro proceso (Discord/OBS) tiene mapeada la DLL en uso, renombra el bloqueo a .old.* y escribe la nueva.
+        const std::wstring oldPath = dstPath + L".old." + std::to_wstring(GetTickCount64());
+        if (!IsPathReparsePoint(oldPath) &&
+            MoveFileExW(dstPath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            MoveFileExW(oldPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            for (int tries = 0; tries < 5; ++tries) {
+                if (CopyFileW(srcPath.c_str(), dstPath.c_str(), FALSE)) {
+                    copied = true;
+                    break;
+                }
+                Sleep(100);
+            }
+        }
     }
     if (!copied) return false;
 
@@ -619,6 +649,7 @@ bool VirtualCameraHost::InstallAndRegisterElevated(std::wstring* outError) {
         if (scm) CloseServiceHandle(scm);
         return fail(L"No se pudo proteger C:\\ProgramData\\ZeroCam (posible reparse point o permiso insuficiente).");
     }
+    CleanupStaleOldDlls(dirPath);
 
     // Pre-crea/valida ipc_ring.bin por handle con tamaño exacto y DACL endurecida (SY/BA/LS/IU, sin AC/BU).
     bool ipcOk = false;
@@ -778,6 +809,7 @@ bool VirtualCameraHost::UninstallAndUnregisterElevated(std::wstring* outError) {
 
     if (!IsPathReparsePoint(L"C:\\ProgramData\\ZeroCam")) {
         for (int tries = 0; tries < 10; ++tries) {
+            CleanupStaleOldDlls(L"C:\\ProgramData\\ZeroCam");
             if (!IsPathReparsePoint(L"C:\\ProgramData\\ZeroCam\\ZeroCamSource.dll")) {
                 DeleteFileW(L"C:\\ProgramData\\ZeroCam\\ZeroCamSource.dll");
             }

@@ -1,7 +1,7 @@
 ; Script de instalador Inno Setup 6 para ZeroCam (Windows 11 x64)
 #define MyAppName "ZeroCam"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.3.2"
+  #define MyAppVersion "1.3.3"
 #endif
 #define MyAppExeName "ZeroCam.exe"
 #define SourceDir "..\dist\ZeroCam-Windows-x64"

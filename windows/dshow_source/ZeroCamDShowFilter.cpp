@@ -35,10 +35,7 @@ constexpr DShowModeDesc kDShowModes[] = {
     { 1280, 720,  60, DShowPixelFmt::YUY2 },
     { 1920, 1080, 60, DShowPixelFmt::I420 },
     { 1920, 1080, 60, DShowPixelFmt::NV12 },
-    { 1920, 1080, 60, DShowPixelFmt::YUY2 },
-    { 640,  480,  30, DShowPixelFmt::I420 },
-    { 640,  480,  30, DShowPixelFmt::NV12 },
-    { 640,  480,  30, DShowPixelFmt::YUY2 }
+    { 1920, 1080, 60, DShowPixelFmt::YUY2 }
 };
 
 void FreeMediaTypeFields(AM_MEDIA_TYPE& mt) noexcept {
@@ -988,7 +985,7 @@ IFACEMETHODIMP ZeroCamDShowPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt, 
     scc->CropGranularityY = 1;
     scc->CropAlignX = 1;
     scc->CropAlignY = 1;
-    scc->MinOutputSize = { 320, 240 };
+    scc->MinOutputSize = { 1280, 720 };
     scc->MaxOutputSize = { 1920, 1080 };
     scc->OutputGranularityX = 2;
     scc->OutputGranularityY = 2;
@@ -998,7 +995,7 @@ IFACEMETHODIMP ZeroCamDShowPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt, 
     scc->ShrinkTapsY = 1;
     scc->MinFrameInterval = 10000000LL / 60LL;
     scc->MaxFrameInterval = 10000000LL / 15LL;
-    scc->MinBitsPerSecond = 640 * 480 * 12 * 15;
+    scc->MinBitsPerSecond = 1280 * 720 * 12 * 15;
     scc->MaxBitsPerSecond = 1920 * 1080 * 16 * 60;
     return S_OK;
 }
