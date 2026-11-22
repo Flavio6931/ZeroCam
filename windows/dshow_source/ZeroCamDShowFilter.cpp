@@ -1106,10 +1106,15 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, DShowPixelFmt dst
 
     BilinearScaleCache scaleCache;
     uint64_t lastSeq = 0;
-    ULONGLONG lastDeliverMs = 0;
+    int64_t lastDeliverQpc = 0;
     LARGE_INTEGER qpcFreq{}, qpcStart{};
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&qpcStart);
+    auto qpcElapsedUs = [&](int64_t fromQpc, int64_t nowQpc) -> int64_t {
+        if (qpcFreq.QuadPart <= 0 || fromQpc <= 0 || nowQpc <= fromQpc) return 0;
+        const int64_t d = nowQpc - fromQpc;
+        return (d / qpcFreq.QuadPart) * 1000000LL + ((d % qpcFreq.QuadPart) * 1000000LL) / qpcFreq.QuadPart;
+    };
     REFERENCE_TIME lastRtStart = -1;
     bool firstSample = true;
 
@@ -1136,26 +1141,32 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, DShowPixelFmt dst
                     41666LL, 666667LL);
             }
         }
-        const ULONGLONG frameMs = std::clamp<ULONGLONG>(static_cast<ULONGLONG>(activeDur / 10000LL), 4ull, 100ull);
+        const int64_t frameDurUs = std::clamp<int64_t>(activeDur / 10LL, 4000LL, 100000LL);
+        const int64_t liveKeepaliveUs = std::max<int64_t>(frameDurUs * 3LL, 120000LL);
 
-        // Espera reactiva de alta resolución: entrega inmediata ante frameSequence nuevo.
+        // Espera reactiva sub-ms con QPC: evita inyectar duplicados a los 33 ms mientras el sensor entrega cada 33.8 ms.
         while (!stopRequested_.load(std::memory_order_acquire)) {
             const uint64_t seqNow = mem ? mem->frameSequence.load(std::memory_order_acquire) : 0ull;
             if (seqNow != 0ull && seqNow != lastSeq) {
                 lastSeq = seqNow;
                 break;
             }
-            const ULONGLONG nowMs = GetTickCount64();
-            if (lastDeliverMs == 0 || nowMs >= lastDeliverMs + frameMs) {
+            const bool liveActive = (mem != nullptr &&
+                                     mem->producerAlive.load(std::memory_order_acquire) != 0 &&
+                                     lastSeq != 0ull);
+            const int64_t waitBudgetUs = liveActive ? liveKeepaliveUs : frameDurUs;
+            LARGE_INTEGER qpcNow{};
+            QueryPerformanceCounter(&qpcNow);
+            if (lastDeliverQpc == 0 || qpcElapsedUs(lastDeliverQpc, qpcNow.QuadPart) >= waitBudgetUs) {
                 break;
             }
             if (paceTimer) {
                 LARGE_INTEGER due{};
-                due.QuadPart = -20000LL; // 2 ms
+                due.QuadPart = -10000LL; // 1 ms
                 SetWaitableTimer(paceTimer, &due, 0, nullptr, nullptr, FALSE);
-                WaitForSingleObject(paceTimer, 5);
+                WaitForSingleObject(paceTimer, 4);
             } else {
-                Sleep(2);
+                Sleep(1);
             }
         }
         if (stopRequested_.load(std::memory_order_acquire)) break;
@@ -1239,7 +1250,9 @@ void ZeroCamDShowPin::PushThreadMain(UINT32 dstW, UINT32 dstH, DShowPixelFmt dst
         sample->SetDiscontinuity(firstSample ? TRUE : FALSE);
         firstSample = false;
 
-        lastDeliverMs = GetTickCount64();
+        LARGE_INTEGER qpcDeliver{};
+        QueryPerformanceCounter(&qpcDeliver);
+        lastDeliverQpc = qpcDeliver.QuadPart;
         hr = memIn->Receive(sample.Get());
         if (FAILED(hr)) {
             break;

@@ -2,6 +2,11 @@
 
 Todos los cambios relevantes del proyecto se documentan en este archivo.
 
+## [1.3.4] - 2026-11-21
+### Corregido
+- **Fluidez real a 30/60 fps en Discord (sin tirones a ~15 fps):**
+  - `ZeroCamDShowFilter` y `ZeroCamMediaStream`: sustituido el pacing tosco de `GetTickCount64()` (`15.6 ms`) y el timeout de `33 ms` en vivo (que inyectaba un frame duplicado viejo justo `1–3 ms` antes de llegar el frame real del sensor a `33.8 ms`, haciendo que WebRTC/Discord descartara los frames nuevos) por **pacing QPC sub-milisegundo** (`QueryPerformanceCounter` + timer de `1 ms`) y **keepalive en vivo de `120 ms`**, reservando el refresco de `33 ms` solo para standby.
+
 ## [1.3.3] - 2026-11-21
 ### Corregido y Mejorado
 - **Negociación HD 16:9 garantizada en Discord (sin zoom ni borrosidad `640×480`):**

@@ -100,6 +100,16 @@ public:
         const long len = pSample->GetActualDataLength();
         if (SUCCEEDED(pSample->GetPointer(&ptr)) && ptr && len > 0) {
             std::lock_guard<std::mutex> lk(mu_);
+            LARGE_INTEGER qpcNow{}, qpcFreq{};
+            QueryPerformanceCounter(&qpcNow);
+            QueryPerformanceFrequency(&qpcFreq);
+            const int64_t prevQpc = lastRecvQpc_.exchange(qpcNow.QuadPart, std::memory_order_acq_rel);
+            if (prevQpc > 0 && qpcNow.QuadPart > prevQpc && qpcFreq.QuadPart > 0) {
+                const int64_t d = qpcNow.QuadPart - prevQpc;
+                const int64_t gapUs = (d / qpcFreq.QuadPart) * 1000000LL + ((d % qpcFreq.QuadPart) * 1000000LL) / qpcFreq.QuadPart;
+                int64_t curMin = minGapUs_.load(std::memory_order_acquire);
+                while (gapUs < curMin && !minGapUs_.compare_exchange_weak(curMin, gapUs, std::memory_order_acq_rel)) {}
+            }
             if (expectedSubtype_ == kMediaSubtypeI420) {
                 const size_t yIdx = (static_cast<size_t>(h_) / 2u) * w_ + (w_ / 2u);
                 const size_t yPlane = static_cast<size_t>(w_) * h_;
@@ -140,6 +150,10 @@ public:
     uint8_t LastY() const noexcept { return lastCenterY_.load(std::memory_order_acquire); }
     uint8_t LastU() const noexcept { return lastCenterU_.load(std::memory_order_acquire); }
     uint8_t LastV() const noexcept { return lastCenterV_.load(std::memory_order_acquire); }
+    int64_t MinGapMs() const noexcept {
+        const int64_t u = minGapUs_.load(std::memory_order_acquire);
+        return (u == 0x7FFFFFFFFFFFFFFFLL) ? 0 : (u / 1000LL);
+    }
 
 private:
     std::atomic<ULONG> refs_{ 1 };
@@ -154,6 +168,8 @@ private:
     std::atomic<uint8_t> lastCenterY_{ 0 };
     std::atomic<uint8_t> lastCenterU_{ 0 };
     std::atomic<uint8_t> lastCenterV_{ 0 };
+    std::atomic<int64_t> lastRecvQpc_{ 0 };
+    std::atomic<int64_t> minGapUs_{ 0x7FFFFFFFFFFFFFFFLL };
 };
 
 } // namespace
@@ -259,11 +275,20 @@ void RunDShowSelfTests(
                 Microsoft::WRL::ComPtr<MockDShowSinkPin> sinkI420;
                 sinkI420.Attach(new MockDShowSinkPin(kMediaSubtypeI420, 1280, 720));
                 if (SUCCEEDED(outPin->Connect(sinkI420.Get(), i420Mt)) && SUCCEEDED(dsFilter->Run(0))) {
-                    for (int w = 0; w < 40 && sinkI420->Frames() < 2u; ++w) {
-                        Sleep(25);
+                    for (int w = 0; w < 20 && sinkI420->Frames() < 1u; ++w) {
+                        Sleep(10);
+                    }
+                    for (int f = 0; f < 4; ++f) {
+                        Sleep(38);
+                        ipc->frameSequence.fetch_add(1, std::memory_order_release);
+                    }
+                    for (int w = 0; w < 20 && sinkI420->Frames() < 5u; ++w) {
+                        Sleep(10);
                     }
                     const uint8_t yMid = sinkI420->LastY();
-                    i420BilinearOk = (sinkI420->Frames() >= 2u &&
+                    i420BilinearOk = (sinkI420->Frames() >= 5u &&
+                                      sinkI420->Frames() <= 6u &&
+                                      sinkI420->MinGapMs() >= 20 &&
                                       sinkI420->LastLen() == (1280L * 720L * 3L) / 2L &&
                                       yMid >= 70u && yMid <= 190u &&
                                       sinkI420->LastU() == 110u &&

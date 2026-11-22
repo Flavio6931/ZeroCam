@@ -150,7 +150,8 @@ private:
 
     int64_t nextSampleTimeHns_ = 0;
     uint64_t lastSeqDelivered_ = 0;
-    ULONGLONG lastDeliverTickMs_ = 0;
+    int64_t lastDeliverQpc_ = 0;
+    int64_t qpcFreq_ = 0;
     HANDLE paceTimer_ = nullptr;
 };
 
