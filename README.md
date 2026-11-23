@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.png" alt="ZeroCam — Cámara Virtual Hardware Zero-Copy para Windows y Android" width="100%" />
+</p>
+
 # ZeroCam `v1.3.5`
 
 Cámara virtual de ultra baja latencia y código limpio para **Windows 10 / Windows 11 x64** y **Android 8.0+**, con pipeline de video H.264 acelerado por hardware **Zero-Copy** de extremo a extremo y transporte autenticado/cifrado **`ZeroCam Wire v2`**.
