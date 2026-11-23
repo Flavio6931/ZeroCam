@@ -29,6 +29,8 @@ android/local.properties
 *.log
 *.tmp
 *.bak
+__pycache__/
+*.pyc
 
 # Archivos de IDE / usuario / metadatos locales
 .vs/
